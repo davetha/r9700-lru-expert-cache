@@ -89,7 +89,18 @@ tune it against your own traffic mix.
 Long context is intact: `bench/needle.py` is **9/9** at 32K / 128K / 200K x depth 10/50/90%,
 the longest prompt being 256,389 tokens.
 
-### Caveats
+#
+### Chunk size and slot budget (measured after the table above)
+
+With the LRU cache VRAM is cheap (~0.5 ms/step per GB of slots), so the launcher now defaults to
+16 GB of slots and `--max-num-batched-tokens 4096`: prefill 3200 -> 3460 tok/s on a 12.5K-token
+prompt, decode unchanged within noise (arm `t5`: 89.3 / 126.7 / 107.3 tok/s). 8192 does not fit
+(KV falls below the 256K minimum); hot 17 GB at 2048 does not fit either. The Triton fp8
+block-scaled fallback (`VLLM_DISABLE_FP8HIP=1`) costs the same as the closed fp8hip kernel
+(2.96 vs 2.82 ms/step over 96 calls, both ~30 us/call, ~270 GB/s) -- neither is near the
+GDDR roofline at decode M, which is the largest remaining kernel-level lever.
+
+## Caveats
 
 * **Restart-to-restart nondeterminism.** Greedy output on this box is stable within a server
   instance and diverges across restarts. The same baseline configuration, re-run later in the

@@ -40,7 +40,7 @@ GPUS=${GPUS:-1,2}
 VRAM_CARDS=${VRAM_CARDS:-"card2 card3"}
 LRU_LIB=${LRU_LIB:-/build/kernels/librlu.so}
 NAME=${NAME:-q38fn-mxfp4}
-HOT_GB=${1:-15.0}
+HOT_GB=${1:-16.0}
 MAXLEN=${2:-262144}
 
 [ -f "$MOUNTS_FILE" ] || { echo "no $MOUNTS_FILE - run patches/apply_patches.sh first" >&2; exit 1; }
@@ -84,7 +84,7 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
     --cpu-offload-gb 40 --cpu-offload-params experts \
     --gpu-memory-utilization "${UTIL:-0.97}" \
     --max-model-len "$MAXLEN" \
-    --max-num-seqs "${NSEQ:-4}" --max-num-batched-tokens "${NBT:-2048}" \
+    --max-num-seqs "${NSEQ:-4}" --max-num-batched-tokens "${NBT:-4096}" \
     --enable-prefix-caching --enable-chunked-prefill \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --limit-mm-per-prompt.image 8 --limit-mm-per-prompt.video 1 --mm-processor-cache-gb .5 \
