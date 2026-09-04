@@ -1,11 +1,11 @@
 # k4 kernel-count patches (bind-mountable working copies)
 
-Working copies of fork files, edited in place under `patches/`.
-Nothing in `/app`, `fork_vllm` or `<host>/hotcold` was touched.
+Working copies of fork files, edited in place under `$REPO/patches/`.
+Nothing in `/app`, `$REPO/fork_vllm` or `$HOME/hotcold` was touched.
 Mount list: `MOUNTS.txt` (one `-v` per line, splice into the launcher).
 
 Baseline for every "per step" number below: the production HIP-graph trace census in
-`k4/KERNEL_HITLIST.md` — **3490 kernels / 61.9 ms / 47.2 ms busy /
+`$REPO/k4/KERNEL_HITLIST.md` — **3490 kernels / 61.9 ms / 47.2 ms busy /
 14.7 ms of inter-kernel gap, median gap 3.72 us** for one full decode step (target
 forward + 4 MTP draft iterations + logits + sampler).
 
@@ -54,6 +54,7 @@ rates unchanged.
 | 5 | `VLLM_R4D_SHARE_A8=1` | no | -52, never traced | reasoned only |
 | 6 | `VLLM_MOE_OUTPUT_ALIAS=1` | no | -48, never traced | reasoned only |
 | 9 | needs `use_local_argmax_reduction` | no | small (-0.14 ms/step) | bit-identical verdict, unanimous across ranks |
+| 7m2 | `VLLM_FUSED_SHARED_GATE=2` | no -- **superseded**, keep off | -52 (~-0.04..-0.12 ms/step over K3's r4d dispatch, estimated) | no divergence in 8.2M elements, but not provable |
 | P-A | mode 3, one Triton kernel | no -- rejected | -64 | 1 element in 81.8M differs from mode 2 |
 
 Per-family elementwise census before/after (489 -> 255 kernels/step, 907 -> 458 us/step)
@@ -564,7 +565,7 @@ the profile. ab3, three prompt types:
 | + `VLLM_DRAFT_W4_LMHEAD=1` | 31.9 / 32.1 / 31.1 | 0.421 / 0.706 / 0.530 | 84.5 / 119.4 / 100.3 |
 
 So the acceptance cost is real (-3 to -9% relative) but smaller than the step saving:
-**net +4 to +8% tok/s**. Adopted in `<host>/launch_q38fn_lru.sh`. This is why the arm
+**net +4 to +8% tok/s**. Adopted in `$HOME/launch_q38fn_lru.sh`. This is why the arm
 has to be read on both numbers -- on ms/step alone the win would have looked like 9%.
 
 ### `VLLM_DRAFT_HS_DUMP` -- capture real draft hidden states (default off)
@@ -590,8 +591,8 @@ what the env says -- that is why those two have never been measured live. `MOUNT
 is COMBO2 plus exactly those four (`qwen_gdn_linear_attn.py`, `fused_sigmoid_gating.py`,
 `fused_gate_mul.py`, `qwen2_moe.py`); COMBO2 is untouched. To measure them:
 
-    MOUNTS_FILE=patches/MOUNTS_COMBO3.txt \
-      <host>/launch_q38fn_lru.sh 15.0     # with -e VLLM_GDN_STRIDED_QKV=1 \
+    MOUNTS_FILE=$REPO/patches/MOUNTS_COMBO3.txt \
+      $HOME/launch_q38fn_lru.sh 15.0     # with -e VLLM_GDN_STRIDED_QKV=1 \
                                               #      -e VLLM_FUSED_SHARED_GATE=1
 
 Both are bit-identical by construction (no numerics change, only fewer launches), so
@@ -712,7 +713,7 @@ MTP tokens, bf16, `use_qk_l2norm_in_kernel=True`, `inplace_final_state=True`):
 Degraded-mount behaviour verified separately (`k4/degraded_gdn.py`): with only the GDN
 file mounted, the probe returns False, logs a warning, and the stock repack runs.
 
-## #7 fused shared-expert gate -- `VLLM_FUSED_SHARED_GATE=1` (2026-09-04, default 0)
+## #7 fused shared-expert gate -- `VLLM_FUSED_SHARED_GATE=1|2` (2026-09-04, default 0)
 
 `patches/model_executor/layers/fused_gate_mul.py` (new file) and
 `patches/model_executor/models/qwen2_moe.py`.
@@ -735,6 +736,129 @@ scales 0.02 / 1.0 / 30.0 so the sigmoid saturates in both directions):
 - **bit-identical** to `F.sigmoid(g) * out` on every shape and scale (`torch.equal`)
 - 2 -> 1 launches, i.e. **-48 kernels/step** at 48 MoE layers -- the hitlist estimate
 - `supported()` refuses a non-`[T, 1]` gate and a dtype mismatch
+
+### Mode 2 -- fold the gate GEMV in too (`VLLM_FUSED_SHARED_GATE=2`, 2026-09-04)
+
+`shared_expert_gate` is `ReplicatedLinear(2560, 1, bias=False)`: **m=1 output column**,
+a handful of rows, bf16. No skinny-GEMM path will take it (`m > 8` and `m % 4` both
+fail), so `F.linear` lands on hipBLASLt, which splits K 32 ways over that single column.
+K3's dispatch census found it as the 52/step `Cijk_..._MT16x16x32` kernels; profiling the
+call directly confirms the same kernel and prices it:
+
+| path | kernels/call | GPU time/call (profiler, T=5) |
+|---|---|---|
+| stock | 3 | `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x32_MI16x16x1_SN_L` 19.91 us + sigmoid 1.97 + mul 5.48 = **27.4 us** |
+| mode 1 | 2 | Cijk 19.91 + fused 2.5 = ~22.4 us |
+| mode 2 | **1** | `_gemv_sigmoid_gate_mul_kernel` **3.35 us** |
+
+Mode 2 does the dot inside the same kernel: read the gate weight row and the hidden-state
+row, accumulate in fp32, round to bf16 exactly as `F.linear` would, sigmoid, multiply.
+
+**Measured in a HIP graph** (`k4/probe_gate_time.py`, 52 calls per graph = one decode
+step's worth, 200 replays, GPU events -- a Python loop measures Triton's ~28 us launch
+overhead and nothing else, which is why the first timing run was thrown away):
+
+| T | stock | mode 1 | mode 2 |
+|---|---|---|---|
+| 1 | 1.182 ms | 0.968 ms | **0.190 ms** |
+| 5 | 1.163 ms | 0.924 ms | **0.176 ms** |
+| 17 | 1.139 ms | 0.911 ms | **0.173 ms** |
+| 64 | 1.129 ms | 0.905 ms | **0.179 ms** |
+
+**-52 launches/step and -0.75 ms/step against mode 1**, which is what the launcher runs
+today; -0.99 ms/step against stock.
+
+### Baseline moved: K3's dispatch fix supersedes most of mode 2 (2026-09-04)
+
+The table above prices mode 2 against `F.linear` -> hipBLASLt, which is what the stack ran
+when it was written. It no longer does. K3 routed this shape to the r4d bf16 GEMV in
+`utils_k3.py` (`VLLM_HC_R4D_BF16_FT_MIN_M=1`, `FT_MIN_N=1`), which serves m=1 at
+**3.43 us/call vs hipBLASLt's 17.0-17.5** and is **`torch.equal` to `F.linear`** at every
+n tested -- so the 0.70 ms/step is already banked, bitwise, in arm t8, without my kernel.
+
+What is left for mode 2 is the launch count only:
+
+| | GEMV | gate-mul | us/call (T=5) | ms/step |
+|---|---|---|---|---|
+| mode 1 + hipBLASLt (measured) | 16.97 | ~0.8 | 17.77 | 0.924 |
+| mode 1 + K3 r4d (estimated) | 3.43 | ~0.8 | ~4.2 | ~0.22 |
+| mode 2 (measured) | folded | folded | 3.38 | **0.176** |
+
+**That row is arithmetic across two harnesses, not one measurement** -- my graph-replay
+probe and K3's `bench_gate1.py` price the same shape but not in the same graph, and the
+dispatch tax for the 52 removed launches (2.4 us each = 0.12 ms if fully serialised) may
+be inside K3's per-call figure or beside it. The remaining win is somewhere in
+**-0.04 to -0.12 ms/step**, i.e. 0.1-0.3% of a 36 ms step.
+
+**Verdict: keep mode 2 off.** It trades a *bitwise* guarantee (K3's path) for an
+unprovable one (mine) to buy ~0.1% -- the wrong side of that trade. The kernel stays in
+the tree, gated, for the case where the gate stops being bitwise-servable or a future
+fusion makes the launch count matter again. Note the two do not stack: mode 2 bypasses
+`self.expert_gate(x)` entirely, so it *replaces* K3's dispatch win for these 52 calls
+rather than adding to it.
+
+One thing the numerics probe does buy: since r4d is bitwise-equal to hipBLASLt, my
+"0 differing elements vs `F.linear`" result holds against the r4d path too, so mode 2
+matches today's production values on every case tested -- just not by construction.
+
+### Mode 2 numerics: no divergence found, but it is a bound, not a proof
+
+hipBLASLt's split-K fp32 reduction order is not observable from outside, so bit-identity
+cannot be *argued*. It can be measured, and the measurement came back clean:
+
+| probe | coverage | elements differing |
+|---|---|---|
+| `k4/probe_gate_gemv.py` | 6 real `shared_expert_gate` weights, T in {1,2,5,8,17,64}, x scales 0.02/0.1/1/4/20 | **0 / 7,449,600** |
+| `k4/probe_gate_adv2.py` | controlled cancellation, dot steered into sigmoid's live range | **0 / 737,280** |
+
+The reason it holds: `x` and `w` are both bf16, so every product `x_i*w_i` is **exact** in
+fp32 (8+8 mantissa bits < 24). Only the accumulation order can differ, and its error
+(~`sqrt(n)*eps32*sum|t|`) has to clear a bf16 ulp of the gate (`2^-9` relative) before
+anything moves. `probe_gate_adv2.py` pushes the cancellation ratio `sum|x_i w_i|/|dot|`
+to **4.1e5** with the dot held in [-4, 4] where sigmoid is steepest, and still finds zero
+differing elements. A first attempt (`k4/probe_gate_adv.py`) was degenerate -- every
+adversarial dot landed at `|g| >= 41`, where bf16 sigmoid saturates to 1.0 and nothing can
+show -- so do not read that one as evidence.
+
+Treat this as "no divergence at 8.2M elements up to 4e5:1 cancellation", not as a
+guarantee. It is a different numerics class from mode 1, hence a different mode number.
+
+### Guards
+
+- Mode 2 only takes `x.shape[0] <= VLLM_FUSED_SHARED_GATE_MAX_ROWS` (default **64**).
+  One workgroup per row is right for a decode step's handful of rows and wrong for a
+  prefill batch, where hipBLASLt is the better kernel; wider batches fall through to
+  mode 1. The branch depends on shape, not data, so HIP-graph capture resolves it once.
+- `supported_gemv()` also requires bf16-vs-bf16-vs-bf16, a `[1, K]` weight matching
+  `x`'s K, contiguous rows on x/w/out, and matching row counts.
+- No hard dependency on the new symbol: the call site does
+  `getattr(fused, "gemv_sigmoid_gate_mul", None)`, so an older `fused_gate_mul.py`
+  mount keeps mode 1 instead of raising.
+- `self.expert_gate.bias is None` is checked; a biased gate takes the stock path.
+- `VLLM_FUSED_SHARED_GATE=1` is unchanged and still bit-identical.
+
+### Smoke
+
+`k4/smoke_imports.py` covers: the gate defaults to 0; equality with the `F.linear` tail
+at T in {1,5,17}; the three guards; **and that `Qwen2MoeMLP.forward` actually takes the
+branch** (a call counter, because both paths return identical values -- a correct kernel
+that is never reached is the failure #1 hit in the k4patch2 arm). The negative control
+matters: perturbing ONE weight element by one bf16 ulp does *not* change the output (2560
+terms; it never reaches the gate's ulp), so the control scales the whole weight by 3%
+instead. The first version of that assertion passed vacuously.
+
+### Recipe
+
+No new mount -- both files are already in `MOUNTS_COMBO4.txt`.
+
+```
+EXTRA_DOCKER_ARGS="... -e VLLM_FUSED_SHARED_GATE=2"
+```
+
+Not bit-identical by construction, so judge the arm on ms/step **and** watch
+`spec_decode_num_accepted`; if the gate scalar never moves, the accept rate should not
+move either.
+
 
 ### Shared caveat for both
 
@@ -858,9 +982,9 @@ if a numerics change is on the table for other reasons.
 `MOUNTS_COMBO4.txt` = `MOUNTS_COMBO3.txt` + the new kernel file:
 
 ```
-MOUNTS_FILE=patches/MOUNTS_COMBO4.txt \
+MOUNTS_FILE=$REPO/patches/MOUNTS_COMBO4.txt \
 EXTRA_DOCKER_ARGS="-e VLLM_GDN_STRIDED_QKV=1 -e VLLM_FUSED_SHARED_GATE=1 -e VLLM_FUSED_SILU_QUANT=1" \
-  <host>/launch_q38fn_lru.sh 15.0
+  $HOME/launch_q38fn_lru.sh 15.0
 ```
 
 The launcher already mounts `hotcold/r4d_mxfp4_moe_lru.py` by default, so no

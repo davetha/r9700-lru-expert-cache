@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Launch Qwen3.8-Flash-Next on 2x R9700 with the device-side LRU expert cache and the
-# kernel-count patches. Every gate that measured a win is on. This is the "c8" arm:
-# 91.8 / 124.1 / 106.2 tok/s (prose / JSON / code), MTP-4, 256K context, prefill ~3170,
-# and 105.7 / 165.7 aggregate at B=1 / B=4.
+# kernel-count patches. Every gate that measured a win is on. Mirrors the production
+# launcher: 15 GB of expert slots per rank, max-num-batched-tokens 4096, MTP-4, 256K ctx.
+# Measured across the arms at these settings: prose ~90-96, JSON ~123-131, code ~103-119
+# tok/s, prefill ~3400-3540, needle 9/9 at 256K.
+#
+# Do not raise the slot budget to 16 GB. It fits only sometimes -- the engine sizes the KV
+# cache from what is left, and arm t8 died on exactly this ("2.4 GiB KV cache is needed,
+# ... available 2.12 GiB") while an earlier 16 GB arm came up fine. NBT 8192 is worse still
+# (0.83 GiB left). 15 GB / NBT 4096 is the largest pair that came up every time.
 #
 # NOTE: this does NOT pin VLLM_GEMMA_NORM_FUSED, so the patched layernorm.py picks its own
 # default (currently 2 = fp32-weight fused norm). Every arm in the README's table ran
@@ -40,7 +46,7 @@ GPUS=${GPUS:-1,2}
 VRAM_CARDS=${VRAM_CARDS:-"card2 card3"}
 LRU_LIB=${LRU_LIB:-/build/kernels/librlu.so}
 NAME=${NAME:-q38fn-mxfp4}
-HOT_GB=${1:-16.0}
+HOT_GB=${1:-15.0}
 MAXLEN=${2:-262144}
 
 [ -f "$MOUNTS_FILE" ] || { echo "no $MOUNTS_FILE - run patches/apply_patches.sh first" >&2; exit 1; }

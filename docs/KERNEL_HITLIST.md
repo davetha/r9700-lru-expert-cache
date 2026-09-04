@@ -23,7 +23,7 @@ every launch) — aligned kernel-for-kernel.
    The 860 eager kernels with no production twin are exactly the ones inductor *did* fuse.
 5. `hitlist.py` / `perlayer.py` — the tables below.
 
-Scripts: `k4/{extract,attrib,align,hitlist,perlayer,graph_census,seq_eager,seq_graph,cmp_eager_graph,regions}.py`.
+Scripts: `$REPO/k4/{extract,attrib,align,hitlist,perlayer,graph_census,seq_eager,seq_graph,cmp_eager_graph,regions}.py`.
 Intermediates: `step_eager_r0.pkl`, `full_eager_r0.pkl`, `full_eager_r0_attr.pkl`, `aligned.pkl`.
 Raw output: `HITLIST_RAW.txt`, `align_out.txt`, `attrib_out.txt`.
 
@@ -173,7 +173,7 @@ Legend: **P** = Python-only (cheap), **K** = needs a new/modified kernel (expens
 | 1a | *If #1's numerics are rejected*: keep fp32 weight but still precompute it once. | `layers/layernorm.py:157` | −64 | −0.30 | **P**, no numerics change |
 | 2 | **GDN qkv repack.** `rearrange_mixed_qkv` does 3 `reshape(-1)` copies **plus** a `torch.cat` — 4 full-qkv copies per GDN layer. (Its docstring claims torch.compile emits one Triton kernel; the production trace shows 3 `elementwise_manual_unroll` + 1 `CatArrayBatchedCopy`.) Best fix: pass strided q/k/v straight to `fused_sigmoid_gating_delta_rule_update` (FLA kernels take strides). | `mamba/gdn/qwen_gdn_linear_attn.py:778-810` | **−144** | **−0.81** | K (kernel signature) |
 | 2a | *Fallback*: one repack kernel `[seq,D] → 3 contiguous blocks` instead of 4 launches. | same | −108 | −0.58 | K (small) |
-| 3 | **Dedup the hot/cold `moe_align_block_size`.** `_apply_split` calls it twice on the *same* `topk_ids` with complementary expert maps → 4 kernels/layer. One kernel can emit both subsets' sorted buffers in a single counting pass. | `patches/hotcold/r4d_mxfp4_moe.py:422-425`; `_custom_ops.py:2254` | **−96** | **−0.55** | K |
+| 3 | **Dedup the hot/cold `moe_align_block_size`.** `_apply_split` calls it twice on the *same* `topk_ids` with complementary expert maps → 4 kernels/layer. One kernel can emit both subsets' sorted buffers in a single counting pass. | `$HOME/hotcold/r4d_mxfp4_moe.py:422-425`; `_custom_ops.py:2254` | **−96** | **−0.55** | K |
 | 4 | **mrope: stop materialising cos/sin.** `triton_mrope` does `cos.contiguous(); sin.contiguous()` on views produced by `cos_sin.chunk(2,-1)` (2 copies per call), preceded by a `cache[positions]` gather. Pass `cos_sin_cache` + `positions` into the Triton kernel and gather/split inside. | `rotary_embedding/mrope.py:193-196`; `indexer_qsa.py:30-45` | **−88** | **−0.49** | K (small Triton) |
 | 4a | *Python-only variant*: keep cos and sin in two separate contiguous caches (2 gathers, 0 copies). | rotary-embedding cache init | −28 | −0.15 | **P** |
 | 5 | **Shared expert re-quantises the routed activation.** `qwen3_next.py:200` passes the same tensor as `hidden_states` and as the shared-expert input; the routed path quantises it at `r4d_mxfp4_moe.py:426` and `_r4d_mxfp4_linear` quantises it *again* at `r4dhip.py:105`. Plumb the existing `(qx, xs)` into the shared expert's first GEMM. | `models/qwen3_next.py:200`; `hotcold/r4d_mxfp4_moe.py:426`; `kernels/linear/mxfp4/r4dhip.py:105` | **−48** | **−0.26** | **P** (plumbing) |
@@ -322,3 +322,43 @@ patch as adopted, and it needs its own bit-identity probe.
 P-A tried to remove them with one Triton kernel and was rejected on numerics, previous section),
 **~30/step PLE index math**, **~20/step QSA `FillFunctor`**. All three are eager-region
 kernels, not missed inductor fusions.
+
+## #7 mode 2: the shared_expert_gate GEMV -- built, then superseded (2026-09-04)
+
+The biggest single kernel-time item left in the census was not an elementwise kernel at
+all. K3's dispatch census flagged 52/step hipBLASLt `Cijk_..._MT16x16x32` at 23 us each;
+they are `shared_expert_gate`, a `ReplicatedLinear(2560, 1)` -- **one output column**, so
+no skinny path can take it (`m > 8` and `m % 4` both fail) and `F.linear` splits K 32 ways
+over a single column. Profiling the call confirms the kernel name and 19.91 us of GPU time
+for 5 dot products.
+
+Folding the dot into `_sigmoid_gate_mul_kernel` (#7 mode 2, `VLLM_FUSED_SHARED_GATE=2`)
+replaces GEMM + sigmoid + mul with one 3.35 us kernel. In a HIP graph holding 52 calls
+(one decode step's worth): stock 1.163 ms, mode 1 0.924 ms, **mode 2 0.176 ms** at T=5 --
+**-52 launches/step, -0.75 ms/step against the mode 1 the launcher runs today**.
+
+No divergence found vs `F.linear`: 0 differing elements in 7,449,600 over 6 real gate
+weights x 6 row counts x 5 magnitude decades, and 0 in 737,280 more with the cancellation
+ratio pushed to 4.1e5 while holding the dot in sigmoid's live range. Both products
+`x_i*w_i` are exact in fp32 (bf16 x bf16), so only the accumulation order differs, and it
+has to clear a bf16 ulp of the gate before anything moves. Not provable -- hipBLASLt's
+split-K order is not observable -- so it is gated and off by default.
+
+Two traps this turned up, both recorded in `patches/PATCHES.md` #7:
+- A Python-loop timing A/B measures Triton's ~28 us launch overhead and nothing else; it
+  ranked mode 1 *slower than stock*. Only graph replay with GPU events prices these.
+- The first adversarial numerics probe was degenerate: every constructed dot landed at
+  `|g| >= 41`, where bf16 sigmoid saturates to 1.0 and no reduction-order difference can
+  reach the output. Steer the dot into [-4, 4] or the probe proves nothing.
+
+**Superseded the same day.** K3 fixed the same 52 calls in the *dispatcher* instead: the
+r4d bf16 GEMV serves m=1 at 3.43 us (vs hipBLASLt 17.0-17.5) and is `torch.equal` to
+`F.linear`, so -0.70 ms/step is banked bitwise in arm t8 without any new kernel. Mode 2
+does not stack with it -- it bypasses `self.expert_gate(x)` entirely -- so its remaining
+value is the 52 launches only, estimated at -0.04 to -0.12 ms/step (0.1-0.3% of a 36 ms
+step) and *not* bitwise by construction. Kept in the tree, gated, default off. Full
+re-pricing in `patches/PATCHES.md`, "Baseline moved".
+
+**The general lesson:** the census pointed at a 1.2 ms/step GEMM and I reached for a fused
+kernel; the cheaper fix was a routing table entry that kept bit-identity. Check whether a
+bad kernel is *chosen* before writing a better one.

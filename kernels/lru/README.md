@@ -15,9 +15,9 @@ is missing from the result.
 |---|---|
 | `r4d_lru.hip` | the kernels — manager, gather, and the fused manager+align |
 | `build.sh` | hipcc build (run it in `local/q38fn-rocm10:k1build`) |
-| **`librlu_v2.so`** | **the current artifact** — gfx1201, loads in `local/q38fn-rocm10:try1`, and what `launch_q38fn_lru.sh` points at |
-| `librlu.so`, `librlu_fused.so` | superseded builds, kept only because running servers still have them mapped. Do **not** rebuild either in place. They are older than `r4d_lru.hip` and must not be shipped. |
-| `r4d_lru.hip.pre-fuse`, `r4d_lru.hip.pre-victim` | historical snapshots of the source, for A/B against the old serial victim loop. Not built by anything. |
+| `build.sh` | builds **one** `librlu.so` (gfx1201) carrying all three entry points, so `VLLM_R4D_LRU=1` and `VLLM_R4D_LRU_FUSE=1` both work against it. Loads in `local/q38fn-rocm10:try1`, which needs no compiler to dlopen it. |
+| — | The working tree this came from had three separate builds (`librlu.so` / `librlu_fused.so` / `librlu_v2.so`) only because the older ones were mmapped by running servers and could not be overwritten in place. `r4d_lru.hip` here is the newest of the three (`librlu_v2.so`); the other two are superseded and are not shipped. |
+| `r4d_lru_pre_victim.hip` | the pre-rewrite source, shipped only so `../../tests/lru/test_victim_equiv.py` has an `OLD_LIB` to compare against. Not for production. Build it with `build.sh <out> kernels/lru/r4d_lru_pre_victim.hip`. |
 | `../../patches/hotcold/r4d_mxfp4_moe_lru.py` | the MoE patch (insert-only diff vs `r4d_mxfp4_moe.py`) — the single live copy; there is deliberately no duplicate in this directory |
 | `gen_lru_py.py` | regenerates that file from the base one |
 | `FUSE.md` | the fused kernel: what it merges, why, and its measured cost |
@@ -27,7 +27,7 @@ is missing from the result.
 | variable | default | meaning |
 |---|---|---|
 | `VLLM_R4D_LRU` | `0` | `1` enables the cache. `0` is byte-for-byte today's static behaviour. |
-| `R4D_LRU_LIB` | — | path to the `.so`. Required when the cache is on. Use `librlu_v2.so`. |
+| `R4D_LRU_LIB` | — | path to the `.so`. Required when the cache is on. |
 | `VLLM_R4D_LRU_THRESH` | `0.5` | a step routing more than this fraction of a layer's slots does no inserts and reads through instead (keeps prefill chunks and wide batches from thrashing the cache) |
 | `VLLM_R4D_LRU_MAX_INSERTS` | `64` | hard cap on inserts per layer per forward; also the miss-buffer size |
 | `VLLM_R4D_LRU_CHUNKS` | `8` | gather grid.x (slab split) |
@@ -117,10 +117,10 @@ adapting. Verified in `test_graph_lru.py`.
 Run everything under the GPU lock, one card:
 
 ```
-flock -w 3600 <repo>/gpu.lock docker run --rm --ipc host --group-add video \
-  --device /dev/kfd --device /dev/dri -e HIP_VISIBLE_DEVICES=1 -v "$REPO_ROOT":/w \
-  -v "$PROFILE_DIR":/hp --entrypoint bash local/q38fn-rocm10:k1build -c \
-  'cd /w/k1/lru && python3 test_lru.py && python3 test_numerics_lru.py &&
+flock -w 3600 $REPO_ROOT/gpu.lock docker run --rm --ipc host --group-add video \
+  --device /dev/kfd --device /dev/dri -e HIP_VISIBLE_DEVICES=1 -v "$REPO_ROOT:/w" \
+  -v "$REPO_ROOT/profiles:/hp" --entrypoint bash local/q38fn-rocm10:k1build -c \
+  'cd /w/tests/lru && python3 test_lru.py && python3 test_numerics_lru.py &&
    NLAYER=4 python3 test_graph_lru.py && python3 test_trace_replay.py &&
    python3 test_fused.py && python3 test_victim_equiv.py'
 ```
@@ -132,10 +132,10 @@ flock -w 3600 <repo>/gpu.lock docker run --rm --ipc host --group-add video \
 | `test_graph_lru.py` | captures 4 layers x (manage + gather) into a HIP graph, replays 20x with changing routing | step counter advances 20, cache mutates, invariants hold, gathered bytes bit-identical |
 | `test_trace_replay.py` | the whole 2330-step production trace x 48 layers through the real kernel with the real 15 GB hot set | static 23.33% / 432.1 MB/step -> LRU 4.62% / 85.6 MB/step (-80.2%), within 0.3% of the simulator |
 | `test_fused.py` | the fused kernel against manager + two `moe_align_block_size` calls | identical state and identical align outputs |
-| `test_victim_equiv.py` | the new victim selection against the old serial loop (`librlu_fused.so`), 19 cases x both kernels: production B=1/B=4, at and past the old cliff, zero misses, both hybrid branches, capped by `max_inserts`, empty slots, stamp ties, evict-all, `S=1024`, `maxi=1`/`1024`. Full state compared exactly, plus a 3-perturbation negative control. | VICTIM EQUIVALENCE PASSED |
+| `test_victim_equiv.py` | the new victim selection against the old serial loop (built from `r4d_lru_pre_victim.hip`), 19 cases x both kernels: production B=1/B=4, at and past the old cliff, zero misses, both hybrid branches, capped by `max_inserts`, empty slots, stamp ties, evict-all, `S=1024`, `maxi=1`/`1024`. Full state compared exactly, plus a 3-perturbation negative control. | VICTIM EQUIVALENCE PASSED |
 | `bench_split.py`, `bench_gather.py`, `bench_fused.py`, `bench_victim.py` | cost | manager 5.91 us/layer, empty gather 3.41, both 8.98 (= 431 us/step over 48 layers); gather 25.2 GB/s at 1 expert, 28.4 at 52; fused 0.466 ms/step |
 
-Timing benchmarks are only valid while holding `<repo>/gpu.lock`, and eager
+Timing benchmarks are only valid while holding `$REPO_ROOT/gpu.lock`, and eager
 launches are CPU-bound (~47 us) and hide the kernel entirely — `bench_victim.py` captures a
 HIP graph of `REP` iterations and takes the min, and any new benchmark here must do the same.
 
@@ -145,7 +145,7 @@ HIP graph of `REP` iterations and takes the min, and any new benchmark here must
 * Inserts beyond `MAX_INSERTS` in one step are simply left cold that step, chosen by lowest
   expert id. Correct, mildly biased, invisible at the measured 1.5 inserts/layer/step.
 * **The 14-insert cliff in the old serial victim loop was never root-caused — it was routed
-  around.** In `r4d_lru.hip.pre-victim` / `librlu_fused.so`, cost per call jumps from 18.6 us
+  around.** In `r4d_lru_pre_victim.hip`, cost per call jumps from 18.6 us
   at 13 inserts to 43.4 at 14, and keeps climbing (225 us at 64). It is not a smooth
   per-insert cost: it is a step. Measured facts, none of which explained it: the threshold is
   `k=14` for `S=257` and `S=320`, `k=16` for `S=200`, and absent at `S=129` up to 16; it does

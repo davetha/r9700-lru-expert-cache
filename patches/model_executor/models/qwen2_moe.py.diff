@@ -8,13 +8,18 @@
  from collections.abc import Iterable
  from itertools import islice
  from typing import Any
-@@ -70,6 +71,29 @@
+@@ -70,6 +71,34 @@
  logger = init_logger(__name__)
  
  
 +# Fuse the shared expert's sigmoid(gate) * out into one Triton launch.
-+# 0 (default) keeps the stock two aten kernels.
-+FUSED_SHARED_GATE = os.environ.get("VLLM_FUSED_SHARED_GATE", "0") == "1"
++# 0 (default) keeps the stock two aten kernels; 1 fuses sigmoid+mul; 2 also folds
++# in the shared_expert_gate GEMV (one kernel for the whole tail, not bit-identical
++# -- see fused_gate_mul.py). Mode 2 only takes decode-sized row counts; wider
++# batches stay on hipBLASLt, which is the right kernel for them.
++_SHARED_GATE_MODE = int(os.environ.get("VLLM_FUSED_SHARED_GATE") or 0)
++FUSED_SHARED_GATE = _SHARED_GATE_MODE >= 1
++_SHARED_GATE_MAX_ROWS = int(os.environ.get("VLLM_FUSED_SHARED_GATE_MAX_ROWS") or 64)
 +_FUSED_GATE_MUL: object = False
 +
 +
@@ -38,15 +43,27 @@
  class Qwen2MoeMLP(nn.Module):
      def __init__(
          self,
-@@ -113,7 +137,13 @@
+@@ -113,7 +142,25 @@
          out, _ = self.down_proj(out)
  
          if self.expert_gate is not None:
 -            out = F.sigmoid(self.expert_gate(x)[0]) * out
-+            gate = self.expert_gate(x)[0]
 +            # One launch instead of two: inductor cannot fuse these because the
-+            # shared expert runs on an aux stream (k4 hitlist #7). Bit-identical.
++            # shared expert runs on an aux stream (k4 hitlist #7). Mode 1 is
++            # bit-identical; mode 2 below is not (it replaces the gate GEMM).
 +            fused = _fused_gate_mul() if FUSED_SHARED_GATE else None
++            if _SHARED_GATE_MODE >= 2 and fused is not None:
++                # Mode 2 folds the [T, K] x [1, K] gate GEMV in too: that GEMM is
++                # a 23 us hipBLASLt split-K over a single output column. Never a
++                # hard dependency -- an older fused_gate_mul.py mount lacks it.
++                gemv = getattr(fused, "gemv_sigmoid_gate_mul", None)
++                w = getattr(self.expert_gate, "weight", None)
++                if (gemv is not None and w is not None
++                        and getattr(self.expert_gate, "bias", None) is None
++                        and fused.supported_gemv(x, w, out,
++                                                 _SHARED_GATE_MAX_ROWS)):
++                    return gemv(x, w, out)
++            gate = self.expert_gate(x)[0]
 +            if fused is not None and fused.supported(gate, out):
 +                return fused.sigmoid_gate_mul(gate, out)
 +            out = F.sigmoid(gate) * out

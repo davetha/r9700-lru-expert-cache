@@ -11,7 +11,7 @@
  import torch
  
  from vllm import _custom_ops as ops
-@@ -113,6 +117,199 @@
+@@ -113,6 +117,271 @@
      )
  
  
@@ -53,6 +53,33 @@
 +# the crossover, and taking it costs nothing: under MTP the target model runs
 +# at n=5 and only the drafter's own handful of calls sees n=1.
 +_R4D_BF16_MIN_N = int(os.environ.get("VLLM_HC_R4D_BF16_MIN_N", "3"))
++# The skinny branches below are all gated on `use_skinny`, and some bf16
++# projections that r4d can serve never satisfy it -- the [512, 2560] MoE router
++# is one, 48 calls/step that reach torch.nn.functional.linear (hipBLASLt, 23 us)
++# while the hyper-connection GEMMs in the same decode step, at the same token
++# count, do take the skinny path. This retries r4d in the fall-through position,
++# after every other branch, so it can only intercept calls that would otherwise
++# go to hipBLASLt. 0 restores the old behaviour for an A/B.
++_R4D_BF16_FALLTHROUGH = os.environ.get("VLLM_HC_R4D_BF16_FT", "1") == "1"
++# Weight-row floor for the fall-through. Default 1: the 1-row
++# shared_expert_gate is the single largest item this intercepts. Measured at
++# [1,2560] bf16, in-graph, n=5: hipBLASLt 16.96 us vs r4d 3.43 us (4.9x), max
++# rel err vs an fp32 reference identical at 1.41e-03. It is 52 calls/step
++# (48 target + 4 MTP), 0.88 ms/step on hipBLASLt -> 0.18 ms/step on r4d.
++# hipBLASLt serves this 1-column output with a 32-way split-K
++# (grid=[32,1,1] block=[32,1,1]), which is nearly all launch and reduction
++# overhead for 12,800 MACs. Raise to 16 to exclude the gate again.
++_R4D_BF16_FT_MIN_M = int(os.environ.get("VLLM_HC_R4D_BF16_FT_MIN_M", "1"))
++# Upper token bound. Measured at the [512,2560] router shape, in-graph, cold:
++# r4d beats hipBLASLt up to n=32 (8.28 vs 8.53 us) and loses beyond it
++# (n=48 9.24 vs 8.56, n=64 9.34 vs 8.53), so past the crossover the
++# fall-through would be a regression rather than a win.
++_R4D_BF16_FT_MAX_N = int(os.environ.get("VLLM_HC_R4D_BF16_FT_MAX_N", "32"))
++# Token floor for the fall-through only. Default 1: at m=1 the 4 MTP draft
++# calls/step run at n=1, where r4d is bitwise-equal to hipBLASLt and 17.41 ->
++# 3.42 us. _R4D_BF16_MIN_N stays 3 for the main skinny branch, where n=1,2
++# still belong to wvSplitK/LLMM1.
++_R4D_BF16_FT_MIN_N = int(os.environ.get("VLLM_HC_R4D_BF16_FT_MIN_N", "1"))
 +
 +
 +@functools.lru_cache(maxsize=1)
@@ -188,9 +215,15 @@
 +
 +
 +def _r4d_bf16_skinny(
-+    x_view: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
++    x_view: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
++    min_n: int | None = None,
 +) -> torch.Tensor | None:
-+    """r4d_gemm_bf16_nt_m64 result, or None when this call does not qualify."""
++    """r4d_gemm_bf16_nt_m64 result, or None when this call does not qualify.
++
++    min_n overrides the token floor. Only the fall-through passes it: that
++    position is reached after every other branch has declined, so lowering
++    the floor there cannot take a call away from wvSplitK or LLMM1.
++    """
 +    if bias is not None:
 +        return None                                   # no bias epilogue
 +    if x_view.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
@@ -198,7 +231,8 @@
 +    if _r4d_bf16_gemm_fn() is None:
 +        return None
 +    m_tok, k = x_view.shape
-+    if not _R4D_BF16_MIN_N <= m_tok <= _R4D_BF16_MAX_M:
++    floor = _R4D_BF16_MIN_N if min_n is None else min_n
++    if not floor <= m_tok <= _R4D_BF16_MAX_M:
 +        return None
 +    if weight.shape[1] != k or not weight.is_contiguous() or not x_view.is_contiguous():
 +        return None
@@ -208,16 +242,75 @@
 +    return torch.ops.vllm.r4d_bf16_gemm(x_view, weight, cfg[0], cfg[1])
 +
 +
++# ---------------------------------------------------------------------------
++# Dispatch census (diagnostic, default off).
++#
++# VLLM_HC_R4D_BF16_DEBUG=1 logs, once per distinct (route, n, m, k), every
++# unquantized GEMM that reaches this function together with the per-call terms
++# of the skinny predicate. It exists because the [512, 2560] MoE router reaches
++# torch.nn.functional.linear (hipBLASLt, 23 us) in production while the
++# hyper-connection GEMMs in the same decode step, at the same token count, take
++# the skinny path -- and a kineto trace cannot tell the two predicates apart.
++_R4D_CENSUS = os.environ.get("VLLM_HC_R4D_BF16_DEBUG", "0") == "1"
++_R4D_CENSUS_SEEN: set = set()
++
++
++def _census(
++    route: str,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++    n: int,
++    m: int,
++    k: int,
++    use_skinny: bool | None = None,
++) -> None:
++    key = (route, n, m, k)
++    if key in _R4D_CENSUS_SEEN:
++        return
++    _R4D_CENSUS_SEEN.add(key)
++    logger.info(
++        "gemm census: n=%d m=%d k=%d -> %s | x %s dim=%d contig=%s | "
++        "w %s contig=%s | bias=%s | use_skinny=%s env_skinny=%s",
++        n, m, k, route,
++        x.dtype, x.dim(), x.is_contiguous(),
++        weight.dtype, weight.is_contiguous(),
++        "None" if bias is None else f"{tuple(bias.shape)}/{bias.is_contiguous()}",
++        use_skinny, bool(envs.VLLM_ROCM_USE_SKINNY_GEMM),
++    )
++
++
  def rocm_unquantized_gemm_impl(
      x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
  ) -> torch.Tensor:
-@@ -187,8 +384,12 @@
+@@ -161,6 +430,8 @@
+ 
+     if use_skinny_reduce_counting:
+         x_view = x.reshape(-1, x.size(-1)).contiguous()
++        if _R4D_CENSUS:
++            _census("wvSplitKrc", x, weight, bias, n, m, k)
+         return ops.wvSplitKrc(x_view, weight, cu_count, bias)
+ 
+     # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
+@@ -170,6 +441,8 @@
+     if use_aiter_triton_gemm(n, m, k, x.dtype) and not (on_gfx1250() and k % 256 != 0):
+         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+ 
++        if _R4D_CENSUS:
++            _census("aiter_gemm_a16w16", x, weight, bias, n, m, k)
+         return gemm_a16w16(x, weight, bias)
+ 
+     use_skinny = (
+@@ -187,18 +460,43 @@
          # reshape can retain a transposed activation's non-contiguous strides.
          x_view = x.reshape(-1, x.size(-1)).contiguous()
          if m > 8 and 0 < n <= 5:
 -            cu_count = num_compute_units()
 -            out = ops.wvSplitK(weight, x_view, cu_count, bias)
 +            out = _r4d_bf16_skinny(x_view, weight, bias)
++            if _R4D_CENSUS:
++                _census("r4d_bf16" if out is not None else "wvSplitK",
++                        x, weight, bias, n, m, k, use_skinny)
 +            if out is None:
 +                # gfx1201 reports 32 WGPs as multi_processor_count, so the grid-stride
 +                # skinny kernel launches only 32 workgroups; let the grid be overridden.
@@ -225,4 +318,32 @@
 +                out = ops.wvSplitK(weight, x_view, cu_count, bias)
              return out.reshape(*x.shape[:-1], weight.shape[0])
          elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
++            if _R4D_CENSUS:
++                _census("LLMM1", x, weight, bias, n, m, k, use_skinny)
              out = ops.LLMM1(weight, x_view, 4)
+             return out.reshape(*x.shape[:-1], weight.shape[0])
+ 
+     if rocm_aiter_ops.is_tgemm_enabled():
+         from aiter.tuned_gemm import tgemm
+ 
++        if _R4D_CENSUS:
++            _census("aiter_tgemm", x, weight, bias, n, m, k, use_skinny)
+         return tgemm.mm(x, weight, bias)
+ 
++    if (_R4D_BF16_FALLTHROUGH and bias is None
++            and m >= _R4D_BF16_FT_MIN_M and 0 < n <= _R4D_BF16_FT_MAX_N):
++        # Reached only when every branch above declined. _r4d_bf16_skinny
++        # re-checks dtype, contiguity, the M band and config legality, so an
++        # unsupported call still lands on the torch GEMM below.
++        x_ft = x.reshape(-1, x.size(-1)).contiguous()
++        out = _r4d_bf16_skinny(x_ft, weight, bias, min_n=_R4D_BF16_FT_MIN_N)
++        if out is not None:
++            if _R4D_CENSUS:
++                _census("r4d_bf16_fallthrough", x, weight, bias, n, m, k, use_skinny)
++            return out.reshape(*x.shape[:-1], weight.shape[0])
++
++    if _R4D_CENSUS:
++        _census("torch_linear", x, weight, bias, n, m, k, use_skinny)
+     return torch.nn.functional.linear(x, weight, bias)
+ 
+ 

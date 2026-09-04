@@ -2,6 +2,8 @@
 # Same as launch_q38fn.sh but with the torch profiler wired up (traces land in /prof, i.e.
 # $PROF_DIR on the host), and with every optimisation gate defaulted OFF, so it doubles as
 # the pre-LRU baseline launcher used for the A/B arms.
+# NBT stays 2048 here, which is what the baseline arms ran; export NBT=4096 to reproduce
+# the t-series arms.
 #
 #   $1  LRU slot budget in GB of expert weights per rank (default 15)
 #   $2  max model len (default 262144)

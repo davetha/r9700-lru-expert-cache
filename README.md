@@ -26,13 +26,46 @@ Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max
 | + GDN strided QKV, fused shared gate (c4) | 89.4 | 122.2 | 105.8 | 30.1 / 31.2 / 29.9 | 3191 | `ab3_c4` |
 | + fused SiLU-quant, QSA rope gather (c7) | 93.2 | 125.9 | 107.4 | 30.2 / 30.3 / 29.6 | 3220 | `ab3_c7` |
 | **c8 — c7 on the v2 victim kernel (what this repo builds)** | **91.8** | **124.1** | **106.2** | 30.0 / 30.8 / 29.4 | 3174 | `ab3_c8_v2` |
+| **t8b — c8 at NBT 4096 with the gate GEMV on r4d (launcher default)** | **91.4** | **130.8** | **118.7** | 29.5 / 29.6 / 30.4 | 3539 | `ab3_t8b` |
 
-The last two rows differ only in which build of the LRU kernel was loaded. `c7` ran the
-older `librlu_fused.so`; `c8` ran `librlu_v2.so`, whose rewritten victim selection is what
-`kernels/lru/r4d_lru.hip` now contains — so **c8 is the row this repository reproduces**.
-The 1.4 / 1.8 / 1.2 tok/s gap between them is inside the run-to-run spread (see caveats):
-the v2 kernel is a wash on single-stream throughput and exists to remove a latency cliff
-that only bites at B>=4 (below).
+`c7` and `c8` differ only in which build of the LRU kernel was loaded. `c7` ran the older
+`librlu_fused.so`; `c8` ran `librlu_v2.so`, whose rewritten victim selection is what
+`kernels/lru/r4d_lru.hip` now contains. The 1.4 / 1.8 / 1.2 tok/s gap between them is
+inside the run-to-run spread (see caveats): the v2 kernel is a wash on single-stream
+throughput and exists to remove a latency cliff that only bites at B>=4 (below).
+
+**`t8b` is what `launch/launch_q38fn.sh` reproduces.** It is `c8` plus
+`max-num-batched-tokens 4096` and the K3 dispatcher change that routes the shared-expert
+gate GEMV to r4d. Read the prose column honestly: the intermediate arm `t1` (NBT 4096, gate
+still on hipBLASLt) measured 96.2 / 122.8 / 103.4, so the gate change bought +8.0 JSON and
++15.3 code but appears to cost ~5 on prose. Prose is the noisiest of the three probes on
+this box — `t1`'s three runs were 71.7 / 96.2 / 95.7 against `t8b`'s 85.6 / 90.7 / 91.4 —
+so treat the prose delta as unresolved rather than as a measured regression.
+
+### The 52 hipBLASLt kernels were a 2560 -> 1 GEMV
+
+`shared_expert_gate` is `ReplicatedLinear(2560, 1, bias=False)`: a single output column.
+The skinny-GEMM path rejected it, so `F.linear` landed on hipBLASLt, which split K 32 ways
+over that one column — the `Cijk_..._MT16x16x32` kernels K3's dispatch census counted at
+**52/step**, 17-23 us each. Letting the r4d bf16 kernel take it instead costs **3.4 us**
+and is `torch.equal` to `F.linear` (0 of 7,449,600 elements differ across 6 real weights,
+6 token counts and 5 input scales), for about **-0.7 ms/step**. The `Cijk` line is simply
+absent from the `t8b` kernel breakdown, where `r4d_gemm_bf16_nt_m64` picks up the extra
+48 calls (292 -> 340).
+
+The dispatcher does this through a fall-through (`VLLM_HC_R4D_BF16_FT`): the main skinny
+branch still requires `n >= 3`, but anything with `m >= 1` and `n <= 32` falls through to
+r4d rather than to hipBLASLt. Wide batches, where hipBLASLt is genuinely the better kernel,
+are above `FT_MAX_N` and keep the old path.
+
+### The closed fp8 GEMM buys nothing
+
+`VLLM_DISABLE_FP8HIP=1` swaps the image's closed `libfp8hip_gemm.so` W8A8 kernel for vLLM's
+own Triton fallback. Arm `t4` measures **99.9 / 123.9 / 113.1** against `t1`'s
+96.2 / 122.8 / 103.4 on the same stack — no worse, and nominally better on prose and code.
+`fp8hip_gemm_w8a8_tiled` is 2.8 ms/step, ~15% of kernel-busy time, so this is worth
+knowing: none of that time is buying anything the open path does not already give you.
+Neither arm was repeated, so read it as "same cost", not as a win for Triton.
 
 Concurrency, aggregate tok/s across streams (`bench/concurrent_bench.py`):
 
@@ -89,18 +122,7 @@ tune it against your own traffic mix.
 Long context is intact: `bench/needle.py` is **9/9** at 32K / 128K / 200K x depth 10/50/90%,
 the longest prompt being 256,389 tokens.
 
-#
-### Chunk size and slot budget (measured after the table above)
-
-With the LRU cache VRAM is cheap (~0.5 ms/step per GB of slots), so the launcher now defaults to
-16 GB of slots and `--max-num-batched-tokens 4096`: prefill 3200 -> 3460 tok/s on a 12.5K-token
-prompt, decode unchanged within noise (arm `t5`: 89.3 / 126.7 / 107.3 tok/s). 8192 does not fit
-(KV falls below the 256K minimum); hot 17 GB at 2048 does not fit either. The Triton fp8
-block-scaled fallback (`VLLM_DISABLE_FP8HIP=1`) costs the same as the closed fp8hip kernel
-(2.96 vs 2.82 ms/step over 96 calls, both ~30 us/call, ~270 GB/s) -- neither is near the
-GDDR roofline at decode M, which is the largest remaining kernel-level lever.
-
-## Caveats
+### Caveats
 
 * **Restart-to-restart nondeterminism.** Greedy output on this box is stable within a server
   instance and diverges across restarts. The same baseline configuration, re-run later in the
@@ -114,13 +136,13 @@ GDDR roofline at decode M, which is the largest remaining kernel-level lever.
   JSON, 0.551 -> 0.530 code). It is net positive here; it may not be on your traffic. The
   later arms partly recover it: `c7` measures 0.462 / 0.704 / 0.545 against `c4`'s
   0.421 / 0.704 / 0.538 — identical on JSON, better on prose and code.
-* **`VLLM_GEMMA_NORM_FUSED` defaults to 2 and every arm from `combo1` onward (including `c4`,
-  `c7`, `c8`) ran with it on** — the `c4` and `c7` profiles show 32 `vllm::rms_norm_kernel`
-  launches per step, which only exist on the fused path. Mode 2 casts to fp32 around the
-  fused kernel so the arithmetic matches the stock decomposition to within the reduction
-  order (~3e-6 of elements differ by one bf16 ulp; none at decode row counts). Mode 1 (bf16
-  weight) perturbs ~30% of elements and is not used by default; `0` is the stock 10-kernel
-  path. See `docs/PATCHES.md` #1.
+* **`VLLM_GEMMA_NORM_FUSED` is a moving part and it now defaults to ON.** The patched
+  `layernorm.py` grew a mode 2 (fp32 weight, no-residual only) that keeps the `+1` in fp32
+  so the arithmetic matches the stock decomposition, and it made 2 the default. **No arm in
+  the table above was measured with it** — every one of them predates that change and ran
+  with the fused norm off. To reproduce the table exactly, export
+  `VLLM_GEMMA_NORM_FUSED=0`. Mode 1 is the original bf16-rounded variant and does perturb
+  numerics; see `docs/PATCHES.md` #1.
 * The ablation that rules out "the machinery, not the policy": `VLLM_R4D_LRU_MAX_INSERTS=0`
   (cache on, inserts disabled) measures 61.1 / 70.5 / 81.4 — indistinguishable from the
   cache-off control.
@@ -273,7 +295,16 @@ gate defaulted **off**; it is what produced the baseline arms.
 | `VLLM_MOE_OUTPUT_ALIAS` | `1` | let the r4d MoE write straight into the caller's output buffer: -48 copies/step |
 | `VLLM_UVA_OFFLOAD_EMBED` | `0` | keep `embed_tokens` in host memory |
 | `VLLM_UVA_OFFLOAD_VISUAL` | `0` | keep the vision tower in host memory |
-| `VLLM_HC_R4D_BF16` | `0` | bf16 dispatch for the hot/cold r4d path (see `docs/HC_QUANT.md`) |
+| `VLLM_HC_R4D_BF16` | `1` | route skinny bf16 linears to the r4d GEMM instead of `wvSplitK` / hipBLASLt. `0` restores the stock dispatch. See `docs/HC_QUANT.md`. |
+| `VLLM_HC_R4D_BF16_MIN_N` | `3` | minimum output width for the main skinny branch. `n=1,2` are left to the fall-through below. |
+| `VLLM_HC_R4D_BF16_FT` | `1` | the fall-through: send anything the main branch rejected to r4d rather than to hipBLASLt. This is what captures the m=1 `shared_expert_gate` GEMV. `0` disables it. |
+| `VLLM_HC_R4D_BF16_FT_MIN_M` | `1` | fall-through lower bound on M |
+| `VLLM_HC_R4D_BF16_FT_MAX_N` | `32` | fall-through upper bound on N. Above this, hipBLASLt is the better kernel and keeps the call. |
+| `VLLM_HC_R4D_BF16_FT_MIN_N` | `1` | fall-through lower bound on N |
+| `VLLM_HC_R4D_BF16_DEBUG` | `0` | log every dispatch decision once per distinct `(route, n, m, k)`. This is how the 52/step gate GEMV was found. |
+| `VLLM_HC_R4D_BF16_WAVES` | `192` | wave-occupancy target the skinny heuristic aims at |
+| `VLLM_HC_R4D_BF16_CFG` | — | force a `"WV,SK"` config, overriding the heuristic. Debug only. |
+| `VLLM_DISABLE_FP8HIP` | `0` | `1` replaces the image's closed `libfp8hip_gemm.so` W8A8 kernel with vLLM's Triton fallback. Measured same cost (arm `t4`). |
 | `VLLM_QSA_ROPE_GATHER` | `0` | fold the cos/sin gather into the mrope Triton kernel (hitlist #12). On in `c7`/`c8`. Degrades to a warning if the patched `mrope.py` is not mounted. |
 
 ## Generating a hot profile

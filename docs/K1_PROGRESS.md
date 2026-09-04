@@ -596,3 +596,57 @@ Answered their two questions:
   preserves that). Flagged it so nobody adds a "skipped rows" mode later.
 - `VLLM_R4D_SHARE_A8=0` is not mine. It is not in any .sh; team-lead passes it per-arm on
   the run_arm.sh command line, and 0 is already the default in r4dhip.py.
+
+## Wrap-up -- k1/lru is the final source (2026-09-04)
+
+Team-lead adopted `librlu_v2.so` as the launcher default after arm c8 (B=1
+91.8/124.1/106.2 tok/s, same as c7 within noise as predicted; B=4 165.7 agg). No
+root-causing of the 14-insert cliff; it is written up as known routed-around behaviour.
+
+**Single source confirmed, not assumed.** `r4d_lru.hip` + `build.sh` is the only build path
+and it produces all three entry points. Rebuilt it clean from the current source to a scratch
+output and compared against the shipped `librlu_v2.so`:
+
+* host `.text`, `.rodata`, `.data.rel.ro`: identical.
+* device code: extracted the gfx1201 code object out of `.hip_fatbin` in both and compared
+  every section. `.text`, `.rodata`, `.note` (kernel metadata), `.dynsym`, `.symtab`,
+  `.AMDGPU.gpr_maximums`: identical. Only `.gnu.hash` / `.hash` / `.dynstr` / `.strtab`
+  differ.
+* Control for that: two back-to-back builds from the *identical* source differ in exactly the
+  same four sections (and in a comparable number of bytes, 92 vs 155). So the build is not
+  bit-reproducible -- HIP emits a per-translation-unit module symbol -- and the residual
+  difference vs `librlu_v2.so` is that, not a source mismatch.
+
+**Trap avoided.** My first two attempts at the device-code comparison used `objcopy
+--only-section` on the amdgcn code object. `objcopy` cannot read it, emitted nothing, and the
+sha256 of empty compared equal to itself -- the probe reported SAME for every section
+including ones that differ. Same failure mode as the earlier shell probes: a comparison that
+cannot see its inputs reports agreement. The real comparison parses the ELF section headers in
+python; it finds 14 sections, which is the sanity check that it is actually reading something.
+
+**Changes made in this wrap-up:**
+
+* `build.sh` -- the export check only grepped `manage|gather`, so a build that dropped the
+  fused kernel would have passed. Now checks all three symbols individually and names the
+  missing one. Verified: positive path prints `exports OK`, and the old `librlu.so` (which
+  genuinely has no `r4d_lru_fused`) is correctly reported as missing it.
+* `README.md` -- rewritten. File table now says which artifact is current and which two are
+  superseded-but-mapped; adds the `VLLM_R4D_LRU_FUSE` / `_FUSE_MAX` knobs, a "Victim
+  selection" section with the equivalence argument and the hybrid `NSER=4` split, the
+  new-vs-old timing table, `test_fused.py` / `test_victim_equiv.py` / `bench_victim.py` in the
+  validation table, and the HIP-graph benchmarking requirement. The old "Known limits" bullet
+  describing the serial victim loop was stale and is replaced by the cliff write-up.
+* Deleted `k1/lru/r4d_mxfp4_moe_lru.py`. It was an orphan snapshot that had drifted from the
+  live `patches/hotcold/r4d_mxfp4_moe_lru.py` by exactly K4's `_act_quant` change, nothing
+  referenced it or mounted it, and two same-named files with different contents is a trap for
+  anyone regenerating a public tree. Recoverable if ever needed: it is the live file with
+  K4's `_act_quant` reverted. Also removed the root-owned `__pycache__` and the build-check
+  artifacts.
+
+**Not re-run:** the GPU validation suite. It passed at 11:36-11:37 against this exact
+`r4d_lru.hip`, and I have just shown the rebuild is device-identical to the `.so` that passed.
+`q38fn-mxfp4` is resident on the cards, so re-running would contend for VRAM with team-lead's
+server for no new information.
+
+**Do not rebuild `librlu.so` or `librlu_fused.so` in place** -- running servers have them
+mapped. They are older than `r4d_lru.hip` and should not ship.
