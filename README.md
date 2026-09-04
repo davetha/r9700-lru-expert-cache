@@ -333,6 +333,10 @@ full expert set (~30 GiB here) plus the KV cache spill.
 
 ## Build
 
+**Shortcut:** `./prebuilt/install.sh` drops prebuilt gfx1201 binaries of our kernels into
+`build/kernels/` (see `prebuilt/README.md`); then you only need steps 1 and 3 below.
+
+
 ```bash
 git clone https://github.com/davetha/r9700-lru-expert-cache
 cd r9700-lru-expert-cache
