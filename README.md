@@ -149,6 +149,134 @@ the longest prompt being 256,389 tokens.
   ran. Its C4 finding ("`VLLM_R4D_LRU_FUSE=1` has never been in an arm") is stale: `c4`, `c5`
   and `c6` all ran with the fused kernel. The rest of it stands.
 
+
+## Benchmark log
+
+Every A/B arm of the campaign, in chronological order. All runs: 2x R9700 (gfx1201) TP=2,
+ image, greedy, MTP-4 unless stated, ,
+ unless stated, single stream,  best-of-3 (256 / 800 / 600
+output tokens for the prose / JSON / code prompts). ms/step is wall time divided by the
+ delta, i.e. one target-verify forward plus its 4 draft
+passes; it is the metric to compare kernel changes on, because any numerics change alters the
+greedy text and therefore the MTP acceptance rate and tok/s.  is accepted / drafted
+tokens. Prefill is a 12.5K-token prompt with  (the probe was added mid-campaign,
+so early arms have no prefill figure). Greedy output on this box is not reproducible across
+server restarts (see caveats), so differences of a few percent between arms are noise.
+
+| arm | configuration | prose | JSON | code | ms/step (prose/JSON/code) | accept (prose/JSON/code) | prefill tok/s |
+|---|---|---|---|---|---|---|---|
+| `r10_base_h15` | baseline: static hot set 15 GB, MTP-4, NBT 2048 (ROCm 10 image) | 60.2 | 68.6 | 89.1 | 46.26/55.28/41.83 | 0.454/0.7/0.686 |  |
+| `r10_skinny0_h15` | baseline + VLLM_ROCM_USE_SKINNY_GEMM=0 (hipBLASLt for bf16 skinny GEMMs) | 60.1 | 67.1 | 84.4 | 46.79/58.18/42.84 | 0.453/0.726/0.655 |  |
+| `mtp2` | baseline, MTP-2 | 62.3 | 63.7 | 79.5 | 36.72/42.7/33.55 | 0.638/0.859/0.831 |  |
+| `mtp3` | baseline, MTP-3 | 60.4 | 68.0 | 85.7 | 40.35/50.68/38.06 | 0.476/0.816/0.755 |  |
+| `vram2_h16` | baseline, hot 16 GB, NSEQ 2, NBT 1024 | 62.2 | 74.3 | 90.5 | 44.75/54.13/41.16 | 0.446/0.754/0.685 |  |
+| `best1_h17_nbt512` | baseline, hot 17 GB, NSEQ 2, NBT 512 | 64.5 | 77.9 | 93.9 | 43.12/51.63/39.71 | 0.446/0.754/0.685 | 1942.7 |
+| `k4patch3` | baseline + K4 kernel-count patches (GemmaRMSNorm mode 1) | 62.1 | 72.1 | 89.2 | 45.3/55.73/41.5 | 0.453/0.754/0.679 | 3108.2 |
+| `k4k3` | baseline + K4 patches + K3 r4d bf16 dispatch | 62.5 | 68.8 | 82.8 | 45.01/55.34/38.33 | 0.453/0.701/0.544 | 3114.6 |
+| `lru0ctl` | LRU build mounted, VLLM_R4D_LRU=0 (control, restart #1) | 58.5 | 66.1 | 76.6 | 44.62/54.78/37.83 | 0.401/0.656/0.475 | 3052.3 |
+| `lru0ctl_b` | LRU build mounted, VLLM_R4D_LRU=0 (control, restart #2) | 60.8 | 68.7 | 81.3 | 44.3/54.89/38.03 | 0.432/0.692/0.522 | 3066.3 |
+| `lru_noins` | LRU=1 with VLLM_R4D_LRU_MAX_INSERTS=0 (machinery on, no inserts) | 61.1 | 70.5 | 81.4 | 45.09/55.88/38.4 | 0.441/0.735/0.531 | 3091.8 |
+| `lru1` | LRU expert cache ON, hot 15 GB, NBT 2048 | 76.7 | 112.6 | 94.1 | 35.14/35.17/34.1 | 0.429/0.744/0.551 | 3161.0 |
+| `lru_h17_nbt512` | LRU ON, hot 17 GB, NSEQ 2, NBT 512 | 86.2 | 113.3 | 94.9 | 33.36/34.61/33.47 | 0.472/0.729/0.542 | 2531.5 |
+| `combo1` | LRU + K4 + K3 + UVA offload of embed_tokens/visual | 81.3 | 110.7 | 93.0 | 34.97/35.24/34.33 | 0.464/0.724/0.547 | 3392.6 |
+| `w4head` | combo1 + W4 draft-only lm_head | 84.5 | 119.4 | 100.3 | 31.89/32.06/31.14 | 0.421/0.706/0.53 | 3195.0 |
+| `c2_mtp3` | w4head stack, MTP-3 | 94.0 | 115.7 | 93.1 | 29.27/29.79/29.7 | 0.588/0.816/0.588 | 3166.6 |
+| `c2_mtp6` | w4head stack, MTP-6 | 75.7 | 115.3 | 101.7 | 37.58/38.77/38.57 | 0.313/0.579/0.489 | 3470.3 |
+| `c4` | + fused LRU bookkeeping kernel, GDN strided qkv, fused shared gate (c4) | 89.4 | 122.2 | 105.8 | 30.14/31.17/29.86 | 0.421/0.704/0.538 | 3190.9 |
+| `c5_localargmax` | c4 + use_local_argmax_reduction (draft argmax) | 88.0 | 129.2 | 101.8 | 31.28/31.44/30.23 | 0.438/0.769/0.519 | 3171.5 |
+| `c6_siluquant` | c4 + fused silu+fp8-quant | 88.7 | 123.0 | 105.7 | 30.37/30.98/30.37 | 0.421/0.704/0.552 | 3169.9 |
+| `c7` | c6 + QSA rope gather fold (c7) | 93.2 | 125.9 | 107.4 | 30.19/30.27/29.55 | 0.462/0.704/0.545 | 3219.8 |
+| `c8_v2` | c7 on librlu_v2 (rewritten victim selection) (c8) | 91.8 | 124.1 | 106.2 | 29.99/30.83/29.43 | 0.438/0.707/0.53 | 3174.1 |
+| `t1_nbt4096` | c8, NBT 4096 | 96.2 | 122.8 | 103.4 | 30.24/30.86/29.61 | 0.477/0.7/0.517 | 3444.9 |
+| `t3_h16` | c8, hot 16 GB | 91.7 | 122.0 | 109.4 | 28.77/30.64/28.56 | 0.41/0.686/0.533 | 3268.1 |
+| `t4_fp8triton` | c8 + VLLM_DISABLE_FP8HIP=1 (Triton fp8 fallback) | 99.9 | 123.9 | 113.1 | 29.47/30.31/31.38 | 0.483/0.69/0.638 | 3262.8 |
+| `t5_h16_nbt4096` | c8, hot 16 GB, NBT 4096 | 89.3 | 126.7 | 107.3 | 29.86/30.21/29.43 | 0.414/0.711/0.541 | 3462.3 |
+| `t7b` | c8 + K3 dispatcher fall-through (census arm) | 89.1 | 131.3 | 114.7 | 30.88/30.77/31.51 | 0.438/0.763/0.654 | 3337.8 |
+| `t8b` | c8, NBT 4096, shared_expert_gate GEMV on r4d (launcher default) | 91.4 | 130.8 | 118.7 | 29.48/29.56/30.44 | 0.424/0.719/0.658 | 3538.7 |
+| `t9` | t8b + experimental fp8 skinny kernel (VLLM_HC_FP8SK=1) | 90.5 | 129.2 | 116.3 | 29.16/29.34/29.82 | 0.407/0.698/0.621 | 3513.2 |
+
+
+### Per-step kernel breakdown, baseline vs final
+
+Median full decode step (target forward + 4 MTP drafts + sampler) from the torch profiler,
+rank 0, top 12 kernels by time. The profiler adds ~2 us per launch, so these step times are
+~15-20% above the unprofiled  in the table above; the proportions are what matter.
+
+**baseline** (`prof_base_h15`): full decode step 55.0 ms under the profiler, 3490 kernel launches, 40.5 ms kernel-busy
+
+| kernel | launches/step | ms/step |
+|---|---|---|
+| `void r4d_gemm_moe_mxfp4a8_nt_b16_kernel` | 192 | 19.28 |
+| `void wvSplitK_hf_sml_` | 248 | 7.55 |
+| `void fp8hip_gemm_w8a8_tiled` | 96 | 2.93 |
+| `void wvSplitK_hf_big_` | 100 | 1.47 |
+| `void r4d_ar_oneshot_2rank_exact_kernel` | 109 | 1.22 |
+| `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_M` | 52 | 1.04 |
+| `void r4d_gemm_mxfp4a8_nt_m64_kernel` | 96 | 0.66 |
+| `void at::native::elementwise_kernel_manual_unr` | 331 | 0.58 |
+| `__amd_rocclr_batchMemOp` | 1 | 0.54 |
+| `void at::native::vectorized_elementwise_kernel` | 339 | 0.43 |
+| `void vllm::moe::topkGating` | 52 | 0.39 |
+| `fused_sigmoid_gating_delta_rule_update_kernel` | 36 | 0.35 |
+
+**final (t8b)** (`prof_t8b_gate_r4d`): full decode step 35.2 ms under the profiler, 2823 kernel launches, 22.9 ms kernel-busy
+
+| kernel | launches/step | ms/step |
+|---|---|---|
+| `void r4d_gemm_moe_mxfp4a8_nt_b16_kernel` | 192 | 5.06 |
+| `void r4d_gemm_bf16_nt_m64_kernel` | 362 | 4.50 |
+| `void fp8hip_gemm_w8a8_tiled` | 96 | 2.84 |
+| `lru_gather_k` | 48 | 1.41 |
+| `void r4d_ar_oneshot_2rank_exact_kernel` | 109 | 1.12 |
+| `void r4d_gemm_w4a16_nt_m64_kernel` | 4 | 1.02 |
+| `__amd_rocclr_batchMemOp` | 1 | 0.80 |
+| `void r4d_gemm_mxfp4a8_nt_m64_kernel` | 96 | 0.67 |
+| `void wvSplitK_hf_sml_` | 39 | 0.55 |
+| `void vllm::moe::topkGating` | 52 | 0.40 |
+| `fused_sigmoid_gating_delta_rule_update_kernel` | 36 | 0.35 |
+| `fused_moe_kernel` | 8 | 0.33 |
+
+
+The MoE grouped GEMM line is the LRU cache: 19.3 ms of cold-expert PCIe reads at 28.4 GB/s
+became 5.1 ms of resident GEMM plus 1.4 ms of  misses.  (the
+hyper-connection bf16 GEMMs) moved to ; the  hipBLASLt line
+(the 2560 -> 1 shared-expert gate) is gone; the four  launches are
+the W4 draft lm_head replacing four ~1 ms bf16 GEMMs that ran outside the annotated forward.
+
+### Concurrency
+
+, B simultaneous streams of 500 tokens on different prompts,
+aggregate tok/s and steady-state ms/step (engine steps = drafts delta / running requests):
+
+| streams | static hot set | LRU only ( stack) | full stack () |
+|---|---|---|---|
+| B=1 | 76.6 (37.9 ms/step) | 94.0 (33.7) | 105.7 (29.9) |
+| B=2 | 88.6 (58.8) | 114.9 (45.5) | — |
+| B=4 | 126.6 (97.1) | 151.8 (79.1) | 165.7 (72.6) |
+
+### Long-context correctness
+
+: a 3-field needle (name / part number / ticket id) at 10 / 50 / 90 % depth
+of 32K, 128K and 200K-line documents, prompts of 36,442 / 148,889 / 256,389 tokens.
+**9/9 PASS** on the LRU stack () and again on the full stack (); the same 9/9
+held on the static-hot-set baseline.
+
+### Numerics probes
+
+ (teacher-forced prompt logprobs on fixed 260-800-token texts) and
+ (greedy decode logprobs), mean |dlogprob| per token:
+
+| pair | prose | code | json |
+|---|---|---|---|
+| two LRU=0 servers, identical config (restart noise floor) | 0.064 | 0.020 | 0.016 |
+| LRU=0 vs LRU=1 with  (cache machinery on, no inserts) | 0.000 | 0.010 | 0.015 |
+| LRU=0 vs LRU=1 | 0.13 | 0.018 | 0.028 |
+
+The LRU's excess over the restart floor is a uniform scale factor across the distribution
+(partition churn: the same rows are computed by the resident and the fallback call on
+different steps), not a tail — a wrong expert would show as a heavy tail. The kernel-level
+tests (, ) are bit-exact.
+
 ## How it works
 
 ```
