@@ -1,0 +1,12 @@
+build/
+prof/
+artifacts/
+gpu.lock
+__pycache__/
+*.pyc
+*.so
+*.npz
+*.npy
+*.pkl
+*.pt.trace.json.gz
+logs/

@@ -1,0 +1,125 @@
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Custom normalization layers."""
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -15,6 +17,35 @@
+ 
+ logger = init_logger(__name__)
+ 
++# ROCm defaults the rms_norm IR priority to ["native"] whenever inductor is on, so the
++# decomposition can be fused (platforms/rocm.py:1130). The QSA indexer's GemmaRMSNorms
++# run in eager regions instead, where "native" means ~10 launched kernels per call and
++# nothing ever fuses them. Take the fused kernel there.
++#   0 = stock decomposition.
++#   1 = one fused kernel with (1 + w) rounded to x's dtype -- fastest, but the bf16
++#       weight rounding changes generated text (max rel 7.8e-3).
++#   2 = fp32-exact (default): cast x up, fuse in fp32, cast back -- 3 kernels, same
++#       arithmetic as stock, so the text is unchanged.
++GEMMA_NORM_FUSED = int(os.environ.get("VLLM_GEMMA_NORM_FUSED") or 2)
++_FUSED_NORM_IMPL: dict[str, object] = {}
++
++
++def _fused_norm_impl(op):
++    """First supported non-native impl for `op`, in the platform's own preference
++    order, or None. Resolved once per op: `supported` is fixed at registration."""
++    impl = _FUSED_NORM_IMPL.get(op.name, False)
++    if impl is False:
++        impl = next(
++            (
++                i
++                for i in (op.impls.get(p) for p in ("aiter", "vllm_c", "oink"))
++                if i is not None and i.supported
++            ),
++            None,
++        )
++        _FUSED_NORM_IMPL[op.name] = impl
++    return impl
++
+ 
+ def poly_norm(
+     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, variance_epsilon: float
+@@ -147,6 +178,65 @@
+         super().__init__()
+         self.weight = nn.Parameter(torch.zeros(hidden_size))
+         self.variance_epsilon = eps
++        # (key, tensor) memo for the dtype-matched (1 + w); rebuilt if the parameter
++        # moves (reload/surgery reallocates) or x changes dtype/device.
++        self._fused_weight: tuple[tuple, torch.Tensor] | None = None
++
++    def _weight_for(self, x: torch.Tensor) -> torch.Tensor:
++        """(1 + w) in x's dtype: every fused rms_norm impl guards on
++        weight.dtype == x.dtype, so an fp32 (1 + w) can never dispatch to one."""
++        w = self.weight
++        # No `w._version` in the key: weights loaded under inference_mode are inference
++        # tensors, and reading _version on one raises. Weights are static after load, so
++        # (address, dtype, device) is sufficient; an in-place reload at the same address
++        # would need an explicit invalidation, which nothing here does.
++        key = (w.data_ptr(), w.dtype, x.dtype, x.device)
++        memo = self._fused_weight
++        if memo is not None and memo[0] == key:
++            return memo[1]
++        fused = (w.float() + 1.0).to(dtype=x.dtype, device=x.device)
++        if torch.cuda.is_current_stream_capturing():
++            # A tensor allocated during capture lives in that graph's private pool and is
++            # not valid for other graphs or eager. vLLM warms up eagerly before capturing,
++            # so this should never fire; say so rather than caching pool memory.
++            logger.warning_once(
++                "GemmaRMSNorm: first (1 + w) built during graph capture; not caching it. "
++                "The fused rms_norm still runs, but the conversion is inside the graph.")
++            return fused
++        self._fused_weight = (key, fused)
++        return fused
++
++    def _try_fused(self, x, residual):
++        """The fused rms_norm kernel for this (x, residual), or None to fall through.
++
++        Must live in forward_native, not forward_cuda: with inductor on, custom_ops
++        defaults to "none", so CustomOp.dispatch_forward returns forward_native and
++        forward_cuda is never called (custom_op.py:191).
++        """
++        if not GEMMA_NORM_FUSED or torch.compiler.is_compiling():
++            return None
++        if GEMMA_NORM_FUSED >= 2:
++            # fp32 x + fp32 (1 + w): the kernel's dtype guard is satisfied without
++            # rounding the weight, so the arithmetic matches the stock decomposition
++            # and only the final cast rounds. Residual case is left to the stock path:
++            # fused_add_rms_norm writes the residual in place, and it must stay bf16.
++            if residual is not None:
++                return None
++            xf = x.float()
++            impl = _fused_norm_impl(ir.ops.rms_norm)
++            args = (xf, self._weight_for(xf), self.variance_epsilon)
++            if impl is None or not impl.supports_args(*args):
++                return None
++            return impl.func_impl_fn(*args).to(x.dtype)
++        if residual is None:
++            impl = _fused_norm_impl(ir.ops.rms_norm)
++            args = (x, self._weight_for(x), self.variance_epsilon)
++        else:
++            impl = _fused_norm_impl(ir.ops.fused_add_rms_norm)
++            args = (x, residual, self._weight_for(x), self.variance_epsilon)
++        if impl is None or not impl.supports_args(*args):
++            return None
++        return impl.func_impl_fn(*args)
+ 
+     def forward_native(
+         self,
+@@ -154,6 +244,11 @@
+         residual: torch.Tensor | None = None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """PyTorch-native implementation equivalent to forward()."""
++        # Only in eager: while tracing, fall through so inductor still sees the fusible
++        # decomposition. Costs the weight's rounding to x's dtype.
++        fused = self._try_fused(x, residual)
++        if fused is not None:
++            return fused
+         weight = self.weight.float() + 1.0
+         if residual is None:
+             return ir.ops.rms_norm(x, weight, self.variance_epsilon)

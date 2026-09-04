@@ -1,0 +1,100 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -86,6 +86,33 @@
+ 
+ logger = init_logger(__name__)
+ 
++# Hand the fused GDN kernel strided views of the packed qkv instead of
++# repacking it (3 reshape copies + a torch.cat = 4 launches per GDN layer).
++# Needs the patched FLA kernel to be mounted too; 0 keeps the stock repack.
++GDN_STRIDED_QKV = os.environ.get("VLLM_GDN_STRIDED_QKV", "0") == "1"
++_FLA_STRIDED: bool | None = None
++
++
++def _fla_supports_strided_qkv() -> bool:
++    """Whether the mounted FLA kernel indexes q/k/v by a token stride.
++
++    Probed, not imported blind: with the stock kernel the strided views would
++    still be correct (its wrapper calls .contiguous()) but would buy nothing,
++    and a silent no-op is worse than a warning.
++    """
++    global _FLA_STRIDED
++    if _FLA_STRIDED is None:
++        from vllm.third_party.flash_linear_attention.ops import (
++            fused_sigmoid_gating as _fsg,
++        )
++
++        _FLA_STRIDED = bool(getattr(_fsg, "SUPPORTS_STRIDED_QKV", False))
++        if not _FLA_STRIDED:
++            logger.warning(
++                "VLLM_GDN_STRIDED_QKV=1 but the mounted fused_sigmoid_gating "
++                "kernel does not take q/k/v token strides; using the repack.")
++    return _FLA_STRIDED
++
+ MAX_FUSED_GDN_MTP_TOKENS = 8
+ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+ 
+@@ -811,6 +838,45 @@
+ 
+         return query, key, value
+ 
++    def rearrange_mixed_qkv_strided(self, mixed_qkv):
++        """Zero-copy [T, q+k+v] -> three (1, T, heads, dim) strided views.
++
++        Same tensors `rearrange_mixed_qkv` returns, minus the 4 copies: the
++        patched fused kernel walks q/k/v by a token stride, so the rows may sit
++        `mixed_qkv.stride(0)` apart instead of packed.
++        """
++        if mixed_qkv is None:
++            return None, None, None
++
++        seq_len = mixed_qkv.shape[0]
++        q_dim = self.key_dim // self.tp_size
++        k_dim = self.key_dim // self.tp_size
++        v_dim = self.value_dim // self.tp_size
++        row = mixed_qkv.stride(0)
++        col = mixed_qkv.stride(1)
++        base = mixed_qkv.storage_offset()
++
++        views = []
++        for off, dim, head_dim in (
++            (0, q_dim, self.head_k_dim),
++            (q_dim, k_dim, self.head_k_dim),
++            (q_dim + k_dim, v_dim, self.head_v_dim),
++        ):
++            views.append(
++                mixed_qkv.as_strided(
++                    (1, seq_len, dim // head_dim, head_dim),
++                    (seq_len * row, row, head_dim * col, col),
++                    base + off * col,
++                )
++            )
++        return tuple(views)
++
++    def _rearrange_for_fused(self, mixed_qkv):
++        """Decode paths only (the fused kernel); prefill keeps the repack."""
++        if GDN_STRIDED_QKV and _fla_supports_strided_qkv():
++            return self.rearrange_mixed_qkv_strided(mixed_qkv)
++        return self.rearrange_mixed_qkv(mixed_qkv)
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1377,7 +1443,7 @@
+         else:
+             mixed_qkv_non_spec = None
+ 
+-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
++        query_spec, key_spec, value_spec = self._rearrange_for_fused(mixed_qkv_spec)
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (
+@@ -1466,7 +1532,7 @@
+ 
+         # 2.2: Process non-spec-decode part
+         if split_non_spec:
+-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
++            query_decode, key_decode, value_decode = self._rearrange_for_fused(
+                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+             )
+             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(

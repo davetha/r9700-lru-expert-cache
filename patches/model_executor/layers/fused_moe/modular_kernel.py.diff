@@ -1,0 +1,24 @@
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
+ from dataclasses import dataclass
+@@ -1334,7 +1335,13 @@
+         if current_platform.is_rocm():
+             from vllm._aiter_ops import rocm_aiter_ops
+ 
+-            if use_output_alias and rocm_aiter_ops.is_fused_moe_enabled():
++            # The AITER gate also excluded the r4d MXFP4 experts, which write every
++            # row of `output` via moe_sum -> the copy was pure overhead (48/step).
++            # VLLM_MOE_OUTPUT_ALIAS=0 restores the AITER-only gate.
++            if use_output_alias and (
++                rocm_aiter_ops.is_fused_moe_enabled()
++                or os.environ.get("VLLM_MOE_OUTPUT_ALIAS", "1") == "1"
++            ):
+                 fused_out = output_alias
+         elif use_output_alias:
+             fused_out = output_alias

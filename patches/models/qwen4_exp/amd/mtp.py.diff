@@ -1,0 +1,271 @@
+--- a/vllm/models/qwen4_exp/amd/mtp.py
++++ b/vllm/models/qwen4_exp/amd/mtp.py
+@@ -13,6 +13,7 @@
+     multi stream [T, hc_count*H] (fed to the next draft step).
+ """
+ 
++import os
+ from collections.abc import Iterable
+ 
+ import regex as re
+@@ -21,7 +22,11 @@
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig, replace, set_current_vllm_config
+-from vllm.distributed import get_pp_group
++from vllm.distributed import (
++    get_pp_group,
++    tensor_model_parallel_all_gather,
++    tensor_model_parallel_all_reduce,
++)
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -46,6 +51,8 @@
+     Qwen4ExpTextConfig,
+ )
+ 
++from vllm.logger import init_logger
++
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+ from .model import (
+@@ -55,6 +62,20 @@
+     Qwen4ExpMixtureOfExperts,
+ )
+ 
++logger = init_logger(__name__)
++
++# Draft-only W4 lm_head. The draft head is 4 of the 5 lm_head GEMMs per decode
++# step and each one streams the whole bf16 shard (124160x2560 = 636 MB/rank) at
++# ~100% of HBM bandwidth. A worse draft only costs MTP acceptance, never target
++# correctness, so 4-bit weights are fair here. 0 = stock bf16 head.
++DRAFT_W4_LMHEAD = os.environ.get("VLLM_DRAFT_W4_LMHEAD", "0") == "1"
++
++# Offline capture of real draft hidden states (for W4 top-1 agreement checks).
++# Rolling: the file always holds the most recent N rows, so the profile run's
++# dummy rows fall out as soon as real traffic arrives.
++DRAFT_HS_DUMP = os.environ.get("VLLM_DRAFT_HS_DUMP") or ""
++DRAFT_HS_DUMP_N = int(os.environ.get("VLLM_DRAFT_HS_DUMP_N") or 200)
++
+ 
+ def _remap_ignored_layers(
+     ignored_layers: list[str],
+@@ -429,6 +450,11 @@
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        # None = not packed yet, False = unavailable (packing is deferred to the
++        # first eager compute_logits: load_eagle_model replaces this lm_head with
++        # the TARGET's module after __init__ and after load_weights).
++        self._draft_w4_head: object | None = None
++        self._hs_dump: list | None = [] if DRAFT_HS_DUMP else None
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -456,9 +482,205 @@
+             spec_step_idx=spec_step_idx,
+         )
+ 
++    def _pack_w4_head_once(self, hidden_states: torch.Tensor) -> None:
++        """Decide the W4 draft head ONCE, and identically on every TP rank.
++
++        Every guard here is evaluated per rank. A split verdict would leave one
++        shard producing W4 logits and the other bf16, and `get_top_tokens`
++        compares those values directly to pick the winning shard -- a ~10%
++        scale difference on one side would bias which shard wins the token.
++        So each rank votes and an all-reduce makes the decision unanimous.
++
++        The all-reduce is unconditional below the guards for a reason: no guard
++        may return early ahead of it, or a guard that diverged across ranks
++        would deadlock instead of disagreeing. Runs once, eagerly, at warmup
++        (the caller refuses to pack during graph capture), so the `.item()`
++        host sync costs nothing at steady state.
++        """
++        lp = self.logits_processor
++        packed: tuple | None = None
++        reason: str | None = None
++
++        if (
++            lp.logits_as_input
++            or lp.scale != 1.0
++            or lp.soft_cap is not None
++            or (lp.head_dtype is not None and lp.head_dtype != hidden_states.dtype)
++        ):
++            # Anything the stock head would apply on top of the GEMM disables
++            # the W4 path rather than being silently dropped.
++            reason = (f"the logits processor is not a plain projection "
++                      f"(scale={lp.scale} soft_cap={lp.soft_cap} "
++                      f"head_dtype={lp.head_dtype})")
++        else:
++            try:
++                # Guarded: this module only exists in the K3 patch mount. Losing
++                # it must cost the W4 speedup, not the server.
++                from vllm.model_executor.kernels.draft_w4_lmhead import (
++                    available,
++                    gemm_w4a16,
++                    pack_w4a16,
++                )
++            except ImportError:
++                reason = ("vllm.model_executor.kernels.draft_w4_lmhead is not "
++                          "mounted")
++            else:
++                w = self.lm_head.weight
++                if not available():
++                    reason = ("draft_w4_lmhead.available() is False (no libr4d "
++                              "w4a16 entry point)")
++                elif w.dim() != 2 or w.shape[1] % 128 != 0:
++                    # The kernel is group-128 only.
++                    reason = (f"the lm_head shard {tuple(w.shape)} is not "
++                              f"group-128 packable")
++                else:
++                    packed = (pack_w4a16(w), gemm_w4a16)
++
++        tp_size = self.lm_head.tp_size
++        if tp_size > 1:
++            vote = torch.tensor([1 if packed is not None else 0],
++                                dtype=torch.int32, device=hidden_states.device)
++            if int(tensor_model_parallel_all_reduce(vote).item()) != tp_size:
++                packed = None
++                reason = reason or "another TP rank refused the W4 head"
++
++        if packed is None:
++            self._draft_w4_head = False
++            logger.warning("VLLM_DRAFT_W4_LMHEAD=1 but %s; the draft lm_head "
++                           "stays bf16 on every rank.", reason)
++        else:
++            self._draft_w4_head = packed
++            logger.info("draft W4 lm_head packed: %s -> 4-bit, draft logits only",
++                        tuple(self.lm_head.weight.shape))
++
++    def _w4_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        """SHARD-LOCAL draft logits through the W4-packed lm_head, or None.
++
++        No all-gather and no vocab trim: `_w4_draft_logits` adds those, while
++        `get_top_tokens` deliberately skips them and reduces (value, index)
++        pairs instead.
++        """
++        if not DRAFT_W4_LMHEAD or self._draft_w4_head is False:
++            return None
++
++        if self._draft_w4_head is None:
++            if torch.cuda.is_current_stream_capturing():
++                # Packing allocates, and the vote is a collective; a tensor made
++                # during capture belongs to that graph's private pool. The eager
++                # profile run normally packs long before capture, so reaching
++                # this means the warmup path changed.
++                logger.warning_once(
++                    "VLLM_DRAFT_W4_LMHEAD=1 but the first draft compute_logits "
++                    "happened during graph capture; this graph keeps the bf16 head.")
++                return None
++            self._pack_w4_head_once(hidden_states)
++            if self._draft_w4_head is False:
++                return None
++
++        packed, gemm_w4a16 = self._draft_w4_head
++        if hidden_states.dim() != 2 or hidden_states.shape[-1] != packed.k:
++            return None
++        logits = gemm_w4a16(hidden_states, packed)
++        lp = self.logits_processor
++        if lp.head_dtype is not None and logits.dtype != lp.head_dtype:
++            logits = logits.to(lp.head_dtype)
++        return logits
++
++    def _w4_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        """Full-vocab draft logits through the W4 head, or None for bf16.
++
++        `self.lm_head` IS the target's module here (load_eagle_model shares it
++        unless the draft sets has_own_lm_head), so the packed copy is a side
++        buffer owned by this wrapper and the target's own compute_logits is
++        untouched. The gather and the padding trim are the stock
++        LogitsProcessor ones, so the draft's argmax sees the same shape and
++        dtype as before.
++        """
++        logits = self._w4_local_logits(hidden_states)
++        if logits is None:
++            return None
++        lp = self.logits_processor
++        if self.lm_head.tp_size > 1:
++            logits = lp._gather_logits(logits)  # noqa: SLF001
++        if logits is not None:
++            logits = logits[..., : lp.org_vocab_size]
++        return logits
++
++    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Greedy draft tokens by rank-local argmax + a (value, index) reduction.
++
++        Used only when `speculative_config.use_local_argmax_reduction` is set;
++        the speculator calls this INSTEAD of compute_logits, so the W4 head has
++        to be folded in here rather than stacked on top of it. Communication
++        drops from O(batch * 248320) to O(batch * 2 * tp_size).
++        """
++        logits = self._w4_local_logits(hidden_states)
++        if logits is None:
++            return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
++
++        # The reduction below is the stock LogitsProcessor.get_top_tokens one
++        # with _apply_head replaced by the W4 GEMM. Its soft_cap and scale
++        # branches are gone because _w4_local_logits refuses both outright.
++        shard = self.lm_head.shard_indices
++        num_pad = shard.num_org_vocab_padding
++        if num_pad > 0:
++            logits[..., -num_pad:] = -float("inf")
++        local_max_vals, local_max_indices = logits.max(dim=-1)
++        global_indices = local_max_indices + shard.org_vocab_start_index
++
++        tp_size = self.lm_head.tp_size
++        if tp_size == 1:
++            return global_indices
++        # fp32 pairs: bf16 cannot hold a 248320-entry vocab index exactly.
++        local_pair = torch.stack(
++            [local_max_vals.float(), global_indices.float()], dim=-1
++        )
++        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
++        gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
++        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
++        top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
++        return top_tokens.squeeze(-1).to(torch.int64)
++
++    def _maybe_dump_hs(self, hidden_states: torch.Tensor) -> None:
++        """Rolling dump of the draft lm_head's input, for offline W4 checks.
++
++        Only meaningful under --enforce-eager: with FULL cudagraphs this python
++        does not re-run on replay, so it would only ever see the warmup rows.
++        Also reports the max |x|, because the W4 kernel's A operand is f16 and
++        anything past 65504 would become inf in the draft.
++        """
++        buf = self._hs_dump
++        if buf is None or torch.cuda.is_current_stream_capturing():
++            return
++        if hidden_states.dim() != 2:
++            return
++        buf.append(hidden_states.detach().float().cpu())
++        if sum(t.shape[0] for t in buf) < DRAFT_HS_DUMP_N:
++            return
++        rows = torch.cat(buf, dim=0)[-DRAFT_HS_DUMP_N:]
++        try:
++            import numpy as np
++
++            np.savez(DRAFT_HS_DUMP, hidden_states=rows.numpy())
++        except Exception:
++            logger.exception("draft hidden-state dump to %s failed; disabling",
++                             DRAFT_HS_DUMP)
++            self._hs_dump = None
++            return
++        logger.info("draft hidden states: wrote %s rows to %s, max|x|=%.1f "
++                    "(f16 max 65504)", rows.shape[0], DRAFT_HS_DUMP,
++                    rows.abs().max().item())
++        # Keep only the tail so the next write is the most recent window.
++        self._hs_dump = [rows]
++
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
++        if self._hs_dump is not None:
++            self._maybe_dump_hs(hidden_states)
++        logits = self._w4_draft_logits(hidden_states)
++        if logits is not None:
++            return logits
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

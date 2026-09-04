@@ -1,0 +1,19 @@
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
+@@ -190,6 +190,16 @@
+         layer.w13_weight = torch.nn.Parameter(
+             layer.w13_weight_packed.data, requires_grad=False
+         )
++        # hot-experts patch: the r4d experts only ever see the weight tensors, so hand
++        # them the layer index and the offloader's UVA flag (which does not survive the
++        # re-wrap above) here; see r4d_mxfp4_moe._build_hot.
++        layer.w13_weight._r4d_uva = getattr(
++            layer.w13_weight_packed, "_vllm_is_uva_offloaded", False)
++        try:
++            from vllm.model_executor.models.utils import extract_layer_index
++            layer.w13_weight._r4d_layer_idx = extract_layer_index(layer.layer_name)
++        except (AssertionError, AttributeError, ValueError):
++            pass
+         delattr(layer, "w13_weight_packed")
+ 
+         layer.w2_weight = torch.nn.Parameter(

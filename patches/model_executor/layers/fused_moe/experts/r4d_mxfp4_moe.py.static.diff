@@ -1,0 +1,367 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py
+@@ -25,11 +25,24 @@
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels import r4d_lib
++from vllm.platforms import current_platform
+ from vllm.model_executor.kernels.linear.mxfp4.r4dhip import (
+     GROUP,
+     pick_cfg,
+     r4d_mxfp4_supported,
+ )
++
++try:
++    # Reuses the fp8 activation the shared expert already made for this hidden_states
++    # (only exists in the patched r4dhip.py; an ImportError here must NOT silently drop
++    # the whole r4d MoE path to Triton emulation, which is 20x slower).
++    from vllm.model_executor.kernels.linear.mxfp4.r4dhip import fp8_quant_shared
++except ImportError:
++    def fp8_quant_shared(x):
++        return ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
++    import logging as _logging
++    _logging.getLogger(__name__).warning(
++        "r4d_mxfp4_moe: patched r4dhip.fp8_quant_shared not mounted; activation quant not shared")
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
+     OCP_MXQuantizationEmulationTritonExperts,
+@@ -43,6 +56,76 @@
+ 
+ BLOCK = 16
+ 
++# ── Hot/cold expert residency (hot-experts patch, 2026-09-04) ─────────────────
++# With `--cpu-offload-params experts` the UVA offloader spills WHOLE per-layer expert
++# tensors first-come, so a layer is either 100% VRAM or 100% host and every routed read
++# in a spilled layer crosses PCIe. Routing is skewed (measured: the top-50% experts of a
++# layer take ~85% of decode routings), so instead: offload ALL expert tensors to host,
++# then at repack time gather each layer's most-used experts into a compact VRAM copy and
++# run the grouped GEMM twice — hot from VRAM, cold from the host tensor — into one
++# output buffer. Needs no kernel change: moe_align_block_size(ignore_invalid_experts=True)
++# with an expert_map emits local ids for one subset only, and the kernel writes only the
++# rows it is given.
++#   VLLM_R4D_HOT_PROFILE=/path.json  {"layers": {"<idx>": {"ranked": [expert ids, most
++#                                     used first], "counts": [...]}}}
++#   VLLM_R4D_HOT_GB=<float>          per-rank VRAM budget (GB, 1e9) for hot expert weights,
++#                                     spent globally on the highest-count (layer, expert)
++#                                     pairs — layers with flatter routing get fewer slots.
++import functools
++import json
++import os
++
++import numpy as np
++
++
++@functools.lru_cache
++def _hot_profile():
++    path = os.environ.get("VLLM_R4D_HOT_PROFILE")
++    if not path:
++        return None
++    with open(path) as f:
++        prof = json.load(f)["layers"]
++    return {int(k): (np.asarray(v["ranked"], dtype=np.int64),
++                     np.asarray(v["counts"], dtype=np.float64)) for k, v in prof.items()}
++
++
++@functools.lru_cache
++def _hot_sets(per_expert_bytes: int) -> dict[int, list[int]]:
++    """Global water-fill: spend the budget on the highest-count (layer, expert) pairs."""
++    prof = _hot_profile()
++    if prof is None:
++        return {}
++    gb = os.environ.get("VLLM_R4D_HOT_GB")
++    if gb is None:
++        raise ValueError("VLLM_R4D_HOT_PROFILE is set but VLLM_R4D_HOT_GB is not")
++    budget = int(float(gb) * 1e9) // per_expert_bytes
++    layers, ranked, counts = [], [], []
++    for li, (r, c) in prof.items():
++        tot = c.sum()
++        if tot <= 0:
++            raise ValueError(f"hot profile layer {li} has no routing counts")
++        layers.append(np.full(len(r), li)); ranked.append(r); counts.append(c / tot)
++    layers, ranked, counts = map(np.concatenate, (layers, ranked, counts))
++    keep = np.argsort(-counts, kind="stable")[:budget]
++    out: dict[int, list[int]] = {li: [] for li in prof}
++    for li, e in zip(layers[keep].tolist(), ranked[keep].tolist()):
++        out[li].append(e)
++    sizes = sorted(len(v) for v in out.values())
++    cov = float(sum(counts[keep])) / len(prof)
++    logger.info_once(
++        "r4d hot experts: budget %d experts/rank (%s GB) over %d layers -> per-layer "
++        "min/median/max %d/%d/%d, profile-estimated routing coverage %.3f",
++        budget, os.environ["VLLM_R4D_HOT_GB"], len(prof), sizes[0],
++        sizes[len(sizes) // 2], sizes[-1], cov)
++    return {li: sorted(v) for li, v in out.items()}
++
++
++def hot_ids_for_layer(layer_idx: int, per_expert_bytes: int) -> list[int] | None:
++    """None -> no profile configured or layer not profiled (single-call path)."""
++    if _hot_profile() is None:
++        return None
++    return _hot_sets(per_expert_bytes).get(layer_idx)
++
+ 
+ def _permute_moe_inplace(w: torch.Tensor) -> None:
+     """[E, N, K/2] uint8 checkpoint order -> r4d fragment order, expert by expert so the
+@@ -117,12 +200,101 @@
+ )
+ 
+ 
++def _r4d_mxfp4_moe_gemm_into(
++    y: torch.Tensor,
++    qx: torch.Tensor,
++    x_scale: torch.Tensor,
++    wq: torch.Tensor,
++    ws_t: torch.Tensor,
++    wref: torch.Tensor,
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_post_pad: torch.Tensor,
++    topk_weights: torch.Tensor | None,
++    mtk: int,
++    top_k: int,
++    wv: int,
++    sk: int,
++    npw: int,
++) -> None:
++    """Same GEMM, writing into caller-owned y so hot and cold subsets fill one buffer.
++    The kernel touches only rows named in sorted_ids (padding sentinels are skipped)."""
++    K = qx.shape[1]
++    N = wq.shape[1]
++    assert y.shape == (mtk, N) and y.dtype == torch.bfloat16 and y.is_contiguous()
++    em = sorted_ids.numel()
++    assert em >= 1 and N % 16 == 0 and K % (sk * GROUP) == 0 \
++        and wv * sk * 32 <= 1024 and npw in (1, 2, 4, 8) \
++        and wv * npw * sk * 1024 <= 64 * 1024
++    r4d_lib.lib().r4d_gemm_moe_mxfp4a8_nt_b16(
++        qx.data_ptr(), x_scale.data_ptr(), wq.data_ptr(), ws_t.data_ptr(),
++        wref.data_ptr(), y.data_ptr(), sorted_ids.data_ptr(), expert_ids.data_ptr(),
++        num_post_pad.data_ptr(),
++        topk_weights.data_ptr() if topk_weights is not None else 0,
++        em, mtk, top_k, K, N, wv, sk, npw,
++        torch.cuda.current_stream().cuda_stream)
++
++
++def _r4d_mxfp4_moe_gemm_into_fake(
++    y: torch.Tensor,
++    qx: torch.Tensor,
++    x_scale: torch.Tensor,
++    wq: torch.Tensor,
++    ws_t: torch.Tensor,
++    wref: torch.Tensor,
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_post_pad: torch.Tensor,
++    topk_weights: torch.Tensor | None,
++    mtk: int,
++    top_k: int,
++    wv: int,
++    sk: int,
++    npw: int,
++) -> None:
++    return None
++
++
++direct_register_custom_op(
++    "r4d_mxfp4_moe_gemm_into",
++    _r4d_mxfp4_moe_gemm_into,
++    mutates_args=["y"],
++    fake_impl=_r4d_mxfp4_moe_gemm_into_fake,
++)
++
++
++# ── Fused silu_and_mul + per-token fp8 quant (k4 hitlist #11) ────────────────
++_FUSED_SILU_QUANT = os.environ.get("VLLM_FUSED_SILU_QUANT", "0") == "1"
++_silu_quant_mod = None
++
++
++def _fused_silu_quant():
++    """The fused kernel, or None if it is not mounted.
++
++    Guarded on purpose: a patched module must never hard-depend on a symbol that
++    only exists in another patched module.
++    """
++    global _silu_quant_mod
++    if _silu_quant_mod is None:
++        try:
++            from vllm.model_executor.layers import fused_silu_mul_quant as _m
++            _silu_quant_mod = _m
++        except ImportError:
++            _silu_quant_mod = False
++            logger.warning(
++                "VLLM_FUSED_SILU_QUANT=1 but vllm.model_executor.layers."
++                "fused_silu_mul_quant is not mounted; the MoE keeps the "
++                "two-launch activation path.")
++    return _silu_quant_mod or None
++
++
+ class R4dMxfp4MoEExperts(OCP_MXQuantizationEmulationTritonExperts):
+     """Emulation experts with the r4d grouped GEMM fast path."""
+ 
+     def __init__(self, moe_config, quant_config):
+         super().__init__(moe_config, quant_config)
+         self._r4d_state: str | None = None  # None -> undecided, "ready", "declined"
++        self._hot: dict | None = None  # hot/cold split state, set in _maybe_repack
+ 
+     def _decline(self, why: str) -> bool:
+         self._r4d_state = "declined"
+@@ -168,12 +340,87 @@
+         self.w2_wref = s2.max(dim=2).values.contiguous()        # [E, Hw]
+         self.cfg1 = pick_cfg(N1, H)
+         self.cfg2 = pick_cfg(Hw, I)
++        self._build_hot(w1, w2)
+         self._r4d_state = "ready"
+         logger.info_once(
+             "R4dMxfp4MoEExperts: repacked E=%d experts (gate_up N=%d K=%d cfg=%s, "
+             "down N=%d K=%d cfg=%s)", E, N1, H, self.cfg1, Hw, I, self.cfg2)
+         return True
+ 
++    def _build_hot(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
++        """Gather this layer's hot experts (ids stashed on the weight Parameter by the
++        quant method) into VRAM. Runs in the profile forward, so the copies are counted
++        in the KV-cache sizing. No-op without a profile or when nothing would move."""
++        layer_idx = getattr(w1, "_r4d_layer_idx", None)
++        if layer_idx is None:
++            return
++        E = w1.shape[0]
++        per_expert = w1[0].numel() * w1.element_size() + w2[0].numel() * w2.element_size()
++        hot = hot_ids_for_layer(layer_idx, per_expert)
++        if hot is None or len(hot) == 0 or len(hot) == E:
++            logger.info("r4d hot experts: layer %d -> %s (single-call path)", layer_idx,
++                        "no profile entry" if hot is None else f"{len(hot)}/{E} hot")
++            return
++        if not getattr(w1, "_r4d_uva", False):
++            raise RuntimeError(
++                f"r4d hot experts: layer {layer_idx} experts are not UVA-offloaded; run "
++                "with --cpu-offload-gb large enough to spill every expert tensor, the hot "
++                "copies ARE the VRAM residency")
++        dev = w1.device
++        hot_t = torch.tensor(hot, dtype=torch.int64, device=dev)
++        is_hot = torch.zeros(E, dtype=torch.bool, device=dev)
++        is_hot[hot_t] = True
++        cold_t = torch.nonzero(~is_hot).squeeze(1)
++        map_hot = torch.full((E,), -1, dtype=torch.int32, device=dev)
++        map_hot[hot_t] = torch.arange(len(hot), dtype=torch.int32, device=dev)
++        map_cold = torch.full((E,), -1, dtype=torch.int32, device=dev)
++        map_cold[cold_t] = cold_t.to(torch.int32)   # cold call indexes the full tensor
++        # index_select from the UVA view lands on the CUDA device -> VRAM copies.
++        self._hot = dict(
++            map_hot=map_hot, map_cold=map_cold, n_hot=len(hot),
++            w1=w1.index_select(0, hot_t).contiguous(),
++            w2=w2.index_select(0, hot_t).contiguous(),
++            w1_ws_t=self.w1_ws_t.index_select(0, hot_t).contiguous(),
++            w1_wref=self.w1_wref.index_select(0, hot_t).contiguous(),
++            w2_ws_t=self.w2_ws_t.index_select(0, hot_t).contiguous(),
++            w2_wref=self.w2_wref.index_select(0, hot_t).contiguous(),
++        )
++        logger.info("r4d hot experts: layer %d -> %d/%d experts resident (%.0f MB)",
++                    layer_idx, len(hot), E, len(hot) * per_expert / 1e6)
++        # VRAM census: where the non-hot memory goes (torch vs non-torch) after each layer
++        free, total = torch.cuda.mem_get_info()
++        logger.info("vram census L%d: device used %.2f GiB, torch allocated %.2f reserved %.2f "
++                    "-> non-torch %.2f GiB", layer_idx, (total - free) / 2**30,
++                    torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30,
++                    (total - free - torch.cuda.memory_reserved()) / 2**30)
++
++    _side_stream: "torch.cuda.Stream | None" = None
++    _SIDE = os.environ.get("VLLM_R4D_HOT_SIDE_STREAM", "0") == "1"
++
++    def _gemm_split(self, y, qx, xs, w_full, ws_t, wref, w_hot, ws_t_hot, wref_hot,
++                    align_hot, align_cold, tw, mtk, top_k, cfg):
++        if not self._SIDE:
++            torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
++                y, qx, xs, w_hot, ws_t_hot, wref_hot, *align_hot, tw, mtk, top_k, *cfg)
++            torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
++                y, qx, xs, w_full, ws_t, wref, *align_cold, tw, mtk, top_k, *cfg)
++            return
++        # The cold call is PCIe-bound (~28 GB/s pull over UVA) and the hot call is VRAM
++        # compute; the two write disjoint rows of y, so run the hot call on a side stream
++        # and let the HIP graph overlap them.
++        cls = type(self)
++        if cls._side_stream is None:
++            cls._side_stream = torch.cuda.Stream()
++        cur = torch.cuda.current_stream()
++        side = cls._side_stream
++        side.wait_stream(cur)
++        with torch.cuda.stream(side):
++            torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
++                y, qx, xs, w_hot, ws_t_hot, wref_hot, *align_hot, tw, mtk, top_k, *cfg)
++        torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
++            y, qx, xs, w_full, ws_t, wref, *align_cold, tw, mtk, top_k, *cfg)
++        cur.wait_stream(side)
++
+     def apply(
+         self,
+         output: torch.Tensor,
+@@ -205,21 +452,67 @@
+         top_k = topk_ids.size(1)
+         mtk = M * top_k
+         N1 = w1.shape[1]
++        if self._hot is not None and expert_map is None:
++            return self._apply_split(output, hidden_states, w1, w2, topk_weights,
++                                     topk_ids, activation, apply_router_weight_on_input)
+         num_align = w1.shape[0] if expert_map is None else global_num_experts
+         sorted_ids, expert_ids, npad = moe_align_block_size(
+             topk_ids, BLOCK, num_align, expert_map)
+ 
+-        qx, xs = ops.scaled_fp8_quant(hidden_states, use_per_token_if_dynamic=True)
++        qx, xs = fp8_quant_shared(hidden_states)
+         ic1 = torch.ops.vllm.r4d_mxfp4_moe_gemm(
+             qx, xs, w1, self.w1_ws_t, self.w1_wref, sorted_ids, expert_ids, npad,
+             None, mtk, top_k, *self.cfg1)                       # [mtk, 2I]
+-        ic2 = torch.empty(mtk, N1 // 2, dtype=hidden_states.dtype,
+-                          device=hidden_states.device)
+-        self.activation(activation, ic2, ic1.view(-1, N1))
+-        q2, s2 = ops.scaled_fp8_quant(ic2, use_per_token_if_dynamic=True)
++        q2, s2 = self._act_quant(activation, ic1, mtk, N1, hidden_states)
+         tw = None if apply_router_weight_on_input else \
+             topk_weights.to(torch.float32).reshape(-1).contiguous()
+         ic3 = torch.ops.vllm.r4d_mxfp4_moe_gemm(
+             q2, s2, w2, self.w2_ws_t, self.w2_wref, sorted_ids, expert_ids, npad,
+             tw, mtk, 1, *self.cfg2)                             # [mtk, H]
+         ops.moe_sum(ic3.view(M, top_k, H), output)
++
++    def _act_quant(self, activation, ic1, mtk, N1, hidden_states):
++        """silu_and_mul + per-token fp8 quant of the MoE intermediate.
++
++        One launch instead of two, and no bf16 round-trip: the activation is
++        only ever read by the quant that follows it. Bit-identical.
++        """
++        fused = _fused_silu_quant() if _FUSED_SILU_QUANT else None
++        if (fused is not None
++                and activation == MoEActivation.SILU
++                and self.activation_config.clamp_limit is None):
++            x = ic1.view(-1, N1)
++            if fused.supported(x):
++                _, q2, s2 = fused.silu_mul_quant(x, current_platform.fp8_dtype())
++                return q2, s2
++        ic2 = torch.empty(mtk, N1 // 2, dtype=hidden_states.dtype,
++                          device=hidden_states.device)
++        self.activation(activation, ic2, ic1.view(-1, N1))
++        return ops.scaled_fp8_quant(ic2, use_per_token_if_dynamic=True)
++
++    def _apply_split(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                     activation, apply_router_weight_on_input):
++        h = self._hot
++        M, H = hidden_states.shape
++        top_k = topk_ids.size(1)
++        mtk = M * top_k
++        N1 = w1.shape[1]
++        E = w1.shape[0]
++        # Each (token, k) slot is in exactly one subset; the two calls fill disjoint rows.
++        align_hot = moe_align_block_size(topk_ids, BLOCK, E, h["map_hot"],
++                                         ignore_invalid_experts=True)
++        align_cold = moe_align_block_size(topk_ids, BLOCK, E, h["map_cold"],
++                                          ignore_invalid_experts=True)
++        qx, xs = fp8_quant_shared(hidden_states)
++        ic1 = torch.empty(mtk, N1, dtype=torch.bfloat16, device=hidden_states.device)
++        self._gemm_split(ic1, qx, xs, w1, self.w1_ws_t, self.w1_wref,
++                         h["w1"], h["w1_ws_t"], h["w1_wref"],
++                         align_hot, align_cold, None, mtk, top_k, self.cfg1)
++        q2, s2 = self._act_quant(activation, ic1, mtk, N1, hidden_states)
++        tw = None if apply_router_weight_on_input else \
++            topk_weights.to(torch.float32).reshape(-1).contiguous()
++        ic3 = torch.empty(mtk, H, dtype=torch.bfloat16, device=hidden_states.device)
++        self._gemm_split(ic3, q2, s2, w2, self.w2_ws_t, self.w2_wref,
++                         h["w2"], h["w2_ws_t"], h["w2_wref"],
++                         align_hot, align_cold, tw, mtk, 1, self.cfg2)
++        ops.moe_sum(ic3.view(M, top_k, H), output)

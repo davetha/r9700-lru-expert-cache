@@ -1,0 +1,174 @@
+# ---------------------------------------------------------------------------
+# r4d bf16 skinny GEMM (gfx1200/gfx1201)
+#
+# libr4d's r4d_gemm_bf16_nt_m64 solves exactly the problem wvSplitK is used for
+# below -- C[M,N] = A[M,K] @ W[N,K]^T, bf16 in and out -- but with 16x16x16 WMMA,
+# so a 16-wide step of K costs ceil(M/16) activation fragments and ONE weight
+# fragment however large M is. wvSplitK's cost instead grows with the token
+# count: measured cold on an R9700 at the 336x10240 hyper-connection
+# down-projection, 14.70 us at n=1 rising to 17.18 us at n=5, against a flat
+# 14.4 us for r4d. Under MTP the decode step runs at n=5, where the whole
+# hyper-connection GEMM set (249 calls, 1.34 GB) is ~10% cheaper this way.
+#
+# VLLM_HC_R4D_BF16=0 restores the wvSplitK path (A/B), VLLM_HC_R4D_BF16_CFG="WV,SK"
+# overrides the launch config.
+#
+# The kernel has NO bias epilogue and only speaks bf16, so a biased or fp16 call
+# keeps the old path. Every other constraint is a std::runtime_error in the C
+# launcher, which through ctypes is std::terminate rather than a Python
+# exception -- so all of them are decided here, and a call that fails any of
+# them falls back instead of raising.
+# ---------------------------------------------------------------------------
+
+_R4D_WAVE32 = 32
+_R4D_BF16_MAX_THREADS = 1024          # r4d_gemm_bf16_nt_m64: WV*SK*32 <= 1024
+_R4D_BF16_MAX_SMEM = 64 * 1024        # WV*SK*256 floats of LDS reduction space
+_R4D_BF16_MAX_M = 64                  # R4D_GEMM64_MAX_M; re-read from the library
+# Waves the k-split is allowed to spread a shape over before it stops helping.
+# 32 WGPs on gfx1201; these shapes are bandwidth-bound, so this only has to be
+# the right order of magnitude.
+_R4D_BF16_WAVE_TARGET = int(os.environ.get("VLLM_HC_R4D_BF16_WAVES", "256"))
+
+
+@functools.lru_cache(maxsize=1)
+def _r4d_bf16_gemm_fn():
+    """ctypes handle for r4d_gemm_bf16_nt_m64, or None if unavailable/disabled.
+
+    The prototype is declared here rather than in r4d_lib.py so this file needs
+    no second mount; ctypes caches the _FuncPtr as an attribute of the CDLL, so
+    the argtypes set here are the ones every later lookup of the symbol sees.
+    """
+    global _R4D_BF16_MAX_M
+    if os.environ.get("VLLM_HC_R4D_BF16", "1") != "1":
+        return None
+    if not current_platform.is_rocm():
+        return None
+    try:
+        from vllm.model_executor.kernels import r4d_lib
+        from vllm.platforms.rocm import _GCN_ARCH
+    except ImportError:
+        return None
+    if "gfx1201" not in _GCN_ARCH and "gfx1200" not in _GCN_ARCH:
+        return None
+    if not r4d_lib.available():
+        logger.warning_once("VLLM_HC_R4D_BF16=1 but libr4d is missing; using wvSplitK")
+        return None
+    try:
+        lib = r4d_lib.lib()
+        fn = lib.r4d_gemm_bf16_nt_m64
+        fn.restype = None
+        # (a, w, c, M, K, N, WV, SK, MB, stream)
+        fn.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 6 + [ctypes.c_long]
+        max_m = lib.r4d_gemm_bf16_nt_m64_max_m
+        max_m.restype = ctypes.c_int
+        max_m.argtypes = []
+        _R4D_BF16_MAX_M = int(max_m())
+    except (OSError, AttributeError) as e:
+        logger.warning_once("libr4d has no r4d_gemm_bf16_nt_m64 (%s); using wvSplitK", e)
+        return None
+    logger.info_once(
+        "Using r4d_gemm_bf16_nt_m64 for skinny bf16 GEMMs (max M=%d)", _R4D_BF16_MAX_M
+    )
+    return fn
+
+
+@functools.lru_cache(maxsize=None)
+def _r4d_bf16_cfg(n_out: int, k: int) -> tuple[int, int] | None:
+    """(WV, SK) for a [n_out, k] weight, or None when no legal config exists.
+
+    One 16-wide column tile per block: at these shapes the kernel is bound by the
+    weight read, so the k-split -- not the column count -- is what fills the
+    machine. SK is the largest legal split that does not spread the shape far
+    past _R4D_BF16_WAVE_TARGET waves.
+    """
+    ntiles = (n_out + 15) // 16
+    override = os.environ.get("VLLM_HC_R4D_BF16_CFG")
+    if override:
+        try:
+            wv, sk = (int(v) for v in override.split(","))
+        except ValueError:
+            wv = sk = 0
+        if (
+            wv >= 1
+            and sk >= 1
+            and k % (sk * 16) == 0
+            and wv * sk * _R4D_WAVE32 <= _R4D_BF16_MAX_THREADS
+            and wv * sk * 256 * 4 <= _R4D_BF16_MAX_SMEM
+        ):
+            return wv, sk
+        logger.warning_once(
+            "VLLM_HC_R4D_BF16_CFG=%r is illegal for N=%d K=%d; using the heuristic",
+            override, n_out, k,
+        )
+    legal = [
+        s
+        for s in (16, 8, 4, 2, 1)
+        if k % (s * 16) == 0 and s * _R4D_WAVE32 <= _R4D_BF16_MAX_THREADS
+    ]
+    if not legal:
+        return None
+    sk = next((s for s in legal if ntiles * s <= _R4D_BF16_WAVE_TARGET), legal[-1])
+    return 1, sk
+
+
+def _r4d_bf16_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor, wv: int, sk: int
+) -> torch.Tensor:
+    m_tok, k = x.shape
+    n_out = weight.shape[0]
+    mb = min(4, (m_tok + 15) // 16)
+    fn = _r4d_bf16_gemm_fn()
+    # The C launcher throws on each of these, which through ctypes is a process
+    # abort -- _r4d_bf16_skinny keeps them unreachable; this is the backstop for
+    # anyone calling the op directly.
+    assert (
+        fn is not None
+        and 1 <= m_tok <= _R4D_BF16_MAX_M
+        and k % (sk * 16) == 0
+        and wv * sk * _R4D_WAVE32 <= _R4D_BF16_MAX_THREADS
+        and wv * sk * 256 * 4 <= _R4D_BF16_MAX_SMEM
+        and 1 <= mb <= 4
+    )
+    out = torch.empty((m_tok, n_out), dtype=torch.bfloat16, device=x.device)
+    fn(
+        x.data_ptr(), weight.data_ptr(), out.data_ptr(),
+        m_tok, k, n_out, wv, sk, mb,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    return out
+
+
+def _r4d_bf16_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor, wv: int, sk: int
+) -> torch.Tensor:
+    return torch.empty(
+        (x.size(0), weight.size(0)), dtype=torch.bfloat16, device=x.device
+    )
+
+
+direct_register_custom_op(
+    op_name="r4d_bf16_gemm",
+    op_func=_r4d_bf16_gemm_impl,
+    fake_impl=_r4d_bf16_gemm_fake,
+)
+
+
+def _r4d_bf16_skinny(
+    x_view: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor | None:
+    """r4d_gemm_bf16_nt_m64 result, or None when this call does not qualify."""
+    if bias is not None:
+        return None                                   # no bias epilogue
+    if x_view.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
+        return None
+    if _r4d_bf16_gemm_fn() is None:
+        return None
+    m_tok, k = x_view.shape
+    if not 1 <= m_tok <= _R4D_BF16_MAX_M:
+        return None
+    if weight.shape[1] != k or not weight.is_contiguous() or not x_view.is_contiguous():
+        return None
+    cfg = _r4d_bf16_cfg(weight.shape[0], k)
+    if cfg is None:
+        return None
+    return torch.ops.vllm.r4d_bf16_gemm(x_view, weight, cfg[0], cfg[1])

@@ -1,0 +1,48 @@
+--- a/vllm/model_executor/kernels/linear/mxfp4/r4dhip.py
++++ b/vllm/model_executor/kernels/linear/mxfp4/r4dhip.py
+@@ -86,6 +86,36 @@
+     return wv, sk, npw
+ 
+ 
++# Single-slot handoff for the fp8 activation quant of a MoE layer's hidden_states: the
++# shared expert (NO_OVERLAP on ROCm, so it runs first) and the routed experts quantize the
++# SAME tensor back to back, so the second caller can reuse the first's result.
++#
++# DEFAULT OFF. Keyed on Python object identity, NOT data_ptr/_version: tensors in the
++# model forward are inference tensors and have no version counter (reading `_version`
++# raises RuntimeError), while a bare data_ptr key is unsound because a freed address is
++# reused by an unrelated tensor. The slot holds a strong ref so the cached object cannot
++# be freed and aliased while live, and the consumer clears it so a hit is served at most
++# once. Still assumes nobody writes into that tensor in place between the two calls --
++# enable only behind a greedy-divergence gate.
++_A8_SHARE = os.environ.get("VLLM_R4D_SHARE_A8", "0") == "1"
++_a8_slot: tuple | None = None
++
++
++def fp8_quant_shared(x: torch.Tensor):
++    """Per-token fp8 quantization of `x`, reusing the immediately preceding result for
++    the same tensor object when VLLM_R4D_SHARE_A8=1."""
++    global _a8_slot
++    if not _A8_SHARE:
++        return ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
++    slot = _a8_slot
++    if slot is not None and slot[0] is x:
++        _a8_slot = None                      # single use: never serve the same hit twice
++        return slot[1], slot[2]
++    qx, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
++    _a8_slot = (x, qx, xs)
++    return qx, xs
++
++
+ def _r4d_mxfp4_linear(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+@@ -102,7 +132,7 @@
+     M, K = x.shape
+     N = weight.shape[0]
+     if 1 <= M <= MAX_M:
+-        qx, x_scale = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
++        qx, x_scale = fp8_quant_shared(x)
+         y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+         mb = min(4, (M + 15) // 16)
+         # Contracts (the C launcher throws -> process abort via ctypes; keep unreachable).

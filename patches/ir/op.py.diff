@@ -1,0 +1,18 @@
+--- a/vllm/ir/op.py
++++ b/vllm/ir/op.py
+@@ -351,6 +351,15 @@
+                 return impl
+ 
+             if not torch.compiler.is_compiling():
++                # A silent fallback here costs real kernels (GemmaRMSNorm fell back
++                # to a 10-kernel native decomposition for months). warning_once is
++                # keyed on the two string args only, so the hot path stays cheap.
++                logger.warning_once(
++                    "IR op %s: provider %s rejected the args, falling back to a "
++                    "lower-priority (possibly native, multi-kernel) implementation.",
++                    self.name,
++                    impl.provider,
++                )
+                 logger.debug(
+                     "Skipping provider %s because it does not support "
+                     "%s with args=%s kwargs=%s",

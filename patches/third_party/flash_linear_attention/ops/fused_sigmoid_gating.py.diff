@@ -1,0 +1,109 @@
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -47,6 +47,9 @@
+     V: tl.constexpr,
+     BK: tl.constexpr,
+     BV: tl.constexpr,
++    stride_q_tok: tl.constexpr,
++    stride_k_tok: tl.constexpr,
++    stride_v_tok: tl.constexpr,
+     stride_init_state_token: tl.constexpr,
+     stride_final_state_token: tl.constexpr,
+     stride_indices_seq: tl.constexpr,
+@@ -80,9 +83,12 @@
+     o_k = i_k * BK + tl.arange(0, BK)
+     o_v = i_v * BV + tl.arange(0, BV)
+ 
+-    p_q = q + (bos * H + i_h) * K + o_k
+-    p_k = k + (bos * H + i_h) * K + o_k
+-    p_v = v + (bos * HV + i_hv) * V + o_v
++    # The token stride is a parameter rather than H*K / HV*V, so q/k/v may be
++    # views into a packed qkv buffer. Contiguous inputs pass H*K / HV*V and
++    # address exactly as before.
++    p_q = q + bos * stride_q_tok + i_h * K + o_k
++    p_k = k + bos * stride_k_tok + i_h * K + o_k
++    p_v = v + bos * stride_v_tok + i_hv * V + o_v
+ 
+     p_A_log = A_log + i_hv
+     if not IS_KDA:
+@@ -170,14 +176,33 @@
+             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+         # Update pointers for next timestep
+-        p_q += H * K
+-        p_k += H * K
++        p_q += stride_q_tok
++        p_k += stride_k_tok
+         p_o += HV * V
+-        p_v += HV * V
++        p_v += stride_v_tok
+         p_b += HV
+         p_a += HV
+ 
+ 
++# Probed by callers before they hand this function strided q/k/v: without the
++# patched kernel the stock wrapper still works, it just copies them first.
++SUPPORTS_STRIDED_QKV = True
++
++
++def _token_stride(t, heads: int, dim: int):
++    """Element stride between consecutive tokens of a [B, T, heads, dim] tensor,
++    or None when the (heads, dim) row is not contiguous and a copy is needed."""
++    if t.ndim != 4 or t.shape[2] != heads or t.shape[3] != dim:
++        return None
++    if t.stride(3) != 1 or t.stride(2) != dim:
++        return None
++    s = t.stride(1)
++    # bos folds batch and token together, so a batch must be exactly T tokens.
++    if t.shape[0] != 1 and t.stride(0) != t.shape[1] * s:
++        return None
++    return s
++
++
+ def fused_sigmoid_gating_delta_rule_update(
+     A_log: torch.Tensor,
+     a: torch.Tensor,
+@@ -228,6 +253,20 @@
+     else:
+         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+ 
++    # A None stride means "copy it": the fallback reproduces the stock layout.
++    stride_q_tok = _token_stride(q, H, K)
++    if stride_q_tok is None:
++        q = q.contiguous()
++        stride_q_tok = H * K
++    stride_k_tok = _token_stride(k, H, K)
++    if stride_k_tok is None:
++        k = k.contiguous()
++        stride_k_tok = H * K
++    stride_v_tok = _token_stride(v, HV, V)
++    if stride_v_tok is None:
++        v = v.contiguous()
++        stride_v_tok = HV * V
++
+     stride_init_state_token = initial_state.stride(0)
+     stride_final_state_token = final_state.stride(0)
+ 
+@@ -246,9 +285,9 @@
+         dt_bias=dt_bias,
+         beta=beta,
+         threshold=threshold,
+-        q=q.contiguous(),
+-        k=k.contiguous(),
+-        v=v.contiguous(),
++        q=q,
++        k=k,
++        v=v,
+         o=o,
+         h0=initial_state,
+         ht=final_state,
+@@ -265,6 +304,9 @@
+         V=V,
+         BK=BK,
+         BV=BV,
++        stride_q_tok=stride_q_tok,
++        stride_k_tok=stride_k_tok,
++        stride_v_tok=stride_v_tok,
+         stride_init_state_token=stride_init_state_token,
+         stride_final_state_token=stride_final_state_token,
+         stride_indices_seq=stride_indices_seq,

@@ -1,0 +1,8 @@
+# ROCm10 image + the two things it is missing for out-of-tree hipcc builds.
+# Nothing about codegen changes.
+#   1. g++  : the base has no libstdc++ headers and an unusable bundled libc++
+#             (no __config_site, no libc++.so), so hipcc cannot compile any .hip host code.
+#   2. libamdhip64.so link symlink: only the versioned libamdhip64.so.7 ships, and the
+#             hip link line names the unversioned path.
+FROM local/q38fn-rocm10:try1
+RUN apt-get update -qq && apt-get install -y -qq g++ bc && rm -rf /var/lib/apt/lists/*  && ln -sf libamdhip64.so.7 /usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamdhip64.so

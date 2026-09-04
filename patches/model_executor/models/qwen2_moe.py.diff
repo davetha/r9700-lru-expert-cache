@@ -1,0 +1,55 @@
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -25,6 +25,7 @@
+ # limitations under the License.
+ """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
+ 
++import os
+ from collections.abc import Iterable
+ from itertools import islice
+ from typing import Any
+@@ -70,6 +71,29 @@
+ logger = init_logger(__name__)
+ 
+ 
++# Fuse the shared expert's sigmoid(gate) * out into one Triton launch.
++# 0 (default) keeps the stock two aten kernels.
++FUSED_SHARED_GATE = os.environ.get("VLLM_FUSED_SHARED_GATE", "0") == "1"
++_FUSED_GATE_MUL: object = False
++
++
++def _fused_gate_mul():
++    """The fused kernel module, or None. Guarded: it only exists in the k4 patch
++    mount, and a missing mount must cost the fusion, not the model."""
++    global _FUSED_GATE_MUL
++    if _FUSED_GATE_MUL is False:
++        try:
++            from vllm.model_executor.layers import fused_gate_mul as _m
++        except ImportError:
++            _m = None
++            logger.warning(
++                "VLLM_FUSED_SHARED_GATE=1 but "
++                "vllm.model_executor.layers.fused_gate_mul is not mounted; "
++                "the shared expert gate stays on the two-kernel path.")
++        _FUSED_GATE_MUL = _m
++    return _FUSED_GATE_MUL
++
++
+ class Qwen2MoeMLP(nn.Module):
+     def __init__(
+         self,
+@@ -113,7 +137,13 @@
+         out, _ = self.down_proj(out)
+ 
+         if self.expert_gate is not None:
+-            out = F.sigmoid(self.expert_gate(x)[0]) * out
++            gate = self.expert_gate(x)[0]
++            # One launch instead of two: inductor cannot fuse these because the
++            # shared expert runs on an aux stream (k4 hitlist #7). Bit-identical.
++            fused = _fused_gate_mul() if FUSED_SHARED_GATE else None
++            if fused is not None and fused.supported(gate, out):
++                return fused.sigmoid_gate_mul(gate, out)
++            out = F.sigmoid(gate) * out
+ 
+         return out
+ 

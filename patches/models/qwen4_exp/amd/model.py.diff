@@ -1,0 +1,106 @@
+--- a/vllm/models/qwen4_exp/amd/model.py
++++ b/vllm/models/qwen4_exp/amd/model.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Inference-only Qwen4Exp model."""
+ 
++import os
+ from collections.abc import Iterable
+ from itertools import islice
+ 
+@@ -11,6 +12,7 @@
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pp_group
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+     QwenGatedDeltaNetAttention,
+@@ -79,6 +81,69 @@
+ from .ple_layer import Qwen4ExpPLELayer
+ from .qsa import Qwen4ExpQSAAttention
+ 
++# k2 patch (2026-09-04): opt-in UVA host offload for embed_tokens / visual.
++# See patches/MOUNTS.txt.template for the bind mount, and the README for the env vars.
++from vllm.model_executor.offloader.base import should_pin_memory
++from vllm.utils.mem_utils import format_gib
++from vllm.utils.platform_utils import is_uva_available
++from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++logger = init_logger(__name__)
++
++
++def _k2_uva_offload_module_params(module: nn.Module, label: str) -> None:
++    """Unconditionally move every parameter of `module` to pinned host memory
++    and expose it to the GPU via UVA (zero-copy), the same mechanism
++    `UVAOffloader._maybe_offload_to_cpu` uses (model_executor/offloader/uva.py)
++    for `--cpu-offload-params`. This is a separate, independent knob (gated by
++    VLLM_UVA_OFFLOAD_EMBED / VLLM_UVA_OFFLOAD_VISUAL below) for parameters
++    that --cpu-offload-gb/--cpu-offload-params never reaches (embed_tokens
++    and the vision tower aren't routed through make_layers()'s offloader
++    call), so it deliberately does NOT touch get_offloader().cpu_offload_bytes
++    -- that counter gates the --cpu-offload-gb expert budget and must stay
++    accurate for that purpose alone.
++
++    Must run at construction time, before weights are loaded: both
++    VocabParallelEmbedding.weight_loader and default_weight_loader do
++    `param.data.copy_(loaded_weight)` (copies values into existing storage,
++    never replaces `.data`), so installing the UVA view here means the real
++    checkpoint weights land in host memory through it, exactly like the
++    make_layers()/offloader case.
++    """
++    if not is_uva_available():
++        logger.warning_once(
++            "[k2_uva_offload] %s: UVA offload requested but is_uva_available() "
++            "is False on this platform; leaving parameters on GPU.",
++            label,
++        )
++        return
++    pin = should_pin_memory()
++    moved_bytes = 0
++    for _name, p in module.named_parameters():
++        # Skip params that aren't real GPU tensors yet: the fork also builds
++        # this model inside PleOffloadWorker, where every parameter is a
++        # meta tensor (p.device.type == "meta") with no storage to copy out
++        # of -- torch.Tensor.to(device="cpu") raises NotImplementedError on
++        # those. Also skip anything already on CPU/UVA. And skip params we
++        # already offloaded (idempotent: some callers may run this twice,
++        # e.g. re-init paths or shared modules).
++        if p.device.type != "cuda":
++            continue
++        if getattr(p, "_vllm_is_uva_offloaded", False):
++            continue
++        cpu_data = p.data.to(device="cpu")
++        if pin:
++            cpu_data = cpu_data.pin_memory()
++        p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
++        p._vllm_is_uva_offloaded = True
++        moved_bytes += p.data.numel() * p.data.element_size()
++    if moved_bytes:
++        logger.info(
++            "[k2_uva_offload] %s: moved %s to UVA host memory",
++            label,
++            format_gib(moved_bytes),
++        )
++
+ 
+ def without_modelopt_fp4(
+     quant_config: QuantizationConfig | None,
+@@ -403,6 +468,8 @@
+             and getattr(config, "indexer_n_heads", None) is not None
+         )
+         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
++        if os.environ.get("VLLM_UVA_OFFLOAD_EMBED", "0") == "1":
++            _k2_uva_offload_module_params(self.embed_tokens, "embed_tokens")
+ 
+         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
+             layer_idx = extract_layer_index(prefix)
+@@ -877,6 +944,8 @@
+                     quant_config=quant_config,
+                     prefix=maybe_prefix(prefix, "visual"),
+                 )
++            if os.environ.get("VLLM_UVA_OFFLOAD_VISUAL", "0") == "1":
++                _k2_uva_offload_module_params(self.visual, "visual")
+ 
+         self.use_deepstack = (
+             not self.language_model_only
