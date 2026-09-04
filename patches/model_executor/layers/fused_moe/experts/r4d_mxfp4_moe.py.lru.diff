@@ -25,7 +25,7 @@
  from vllm.model_executor.layers.fused_moe.activation import MoEActivation
  from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
      OCP_MXQuantizationEmulationTritonExperts,
-@@ -43,6 +56,319 @@
+@@ -43,6 +56,329 @@
  
  BLOCK = 16
  
@@ -68,6 +68,16 @@
 +# work with no host sync so the whole thing is HIP-graph capturable: only the CONTENTS of
 +# table/map_cold/slot buffers change between replays, never a pointer.
 +import functools
++
++
++def _cfg_override(env: str, default, N: int, K: int):
++    v = os.environ.get(env, "")
++    if not v:
++        return default
++    wv, sk, npw = (int(x) for x in v.split(","))
++    assert K % (sk * GROUP) == 0 and wv * sk * 32 <= 1024 and npw in (1, 2, 4, 8) \
++        and wv * npw * sk * 1024 <= 64 * 1024, f"{env}={v} invalid for N={N} K={K}"
++    return (wv, sk, npw)
 +import json
 +import os
 +
@@ -345,7 +355,7 @@
  
  def _permute_moe_inplace(w: torch.Tensor) -> None:
      """[E, N, K/2] uint8 checkpoint order -> r4d fragment order, expert by expert so the
-@@ -117,12 +443,76 @@
+@@ -117,12 +453,76 @@
  )
  
  
@@ -422,10 +432,16 @@
  
      def _decline(self, why: str) -> bool:
          self._r4d_state = "declined"
-@@ -168,12 +558,168 @@
+@@ -166,14 +566,172 @@
+         self.w1_wref = s1.max(dim=2).values.contiguous()        # [E, N1]
+         self.w2_ws_t = s2.transpose(1, 2).contiguous()          # [E, I/32, Hw]
          self.w2_wref = s2.max(dim=2).values.contiguous()        # [E, Hw]
-         self.cfg1 = pick_cfg(N1, H)
-         self.cfg2 = pick_cfg(Hw, I)
+-        self.cfg1 = pick_cfg(N1, H)
+-        self.cfg2 = pick_cfg(Hw, I)
++        # VLLM_R4D_MOE_CFG1/2 = "wv,sk,npw" override pick_cfg for the grouped MoE GEMMs only.
++        # k1/hotprobe sweep (2026-09-04): decode wins (1,2,4) for gate_up and (1,1,1) for down.
++        self.cfg1 = _cfg_override("VLLM_R4D_MOE_CFG1", pick_cfg(N1, H), N1, H)
++        self.cfg2 = _cfg_override("VLLM_R4D_MOE_CFG2", pick_cfg(Hw, I), Hw, I)
 +        self._build_hot(w1, w2)
          self._r4d_state = "ready"
          logger.info_once(
@@ -591,7 +607,7 @@
      def apply(
          self,
          output: torch.Tensor,
-@@ -205,21 +751,72 @@
+@@ -205,21 +763,72 @@
          top_k = topk_ids.size(1)
          mtk = M * top_k
          N1 = w1.shape[1]

@@ -26,7 +26,8 @@ Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max
 | + GDN strided QKV, fused shared gate (c4) | 89.4 | 122.2 | 105.8 | 30.1 / 31.2 / 29.9 | 3191 | `ab3_c4` |
 | + fused SiLU-quant, QSA rope gather (c7) | 93.2 | 125.9 | 107.4 | 30.2 / 30.3 / 29.6 | 3220 | `ab3_c7` |
 | **c8 — c7 on the v2 victim kernel (what this repo builds)** | **91.8** | **124.1** | **106.2** | 30.0 / 30.8 / 29.4 | 3174 | `ab3_c8_v2` |
-| **t8b — c8 at NBT 4096 with the gate GEMV on r4d (launcher default)** | **91.4** | **130.8** | **118.7** | 29.5 / 29.6 / 30.4 | 3539 | `ab3_t8b` |
+| t8b — c8 at NBT 4096 with the gate GEMV on r4d | 91.4 | 130.8 | 118.7 | 29.5 / 29.6 / 30.4 | 3539 | `ab3_t8b` |
+| **cfg — t8b + MoE GEMM launch config (1,2,4)/(1,1,1) (launcher default)** | **90.9-94.1** | **128.3-128.5** | **121.0-123.2** | 28.5-29.3 / 29.2 / 29.9 | 3502-3544 | `ab3_cfg124_111`, `ab3_cfg2` |
 
 `c7` and `c8` differ only in which build of the LRU kernel was loaded. `c7` ran the older
 `librlu_fused.so`; `c8` ran `librlu_v2.so`, whose rewritten victim selection is what
@@ -34,7 +35,10 @@ Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max
 inside the run-to-run spread (see caveats): the v2 kernel is a wash on single-stream
 throughput and exists to remove a latency cliff that only bites at B>=4 (below).
 
-**`t8b` is what `launch/launch_q38fn.sh` reproduces.** It is `c8` plus
+**`cfg` is what `launch/launch_q38fn.sh` reproduces**: `t8b` plus the two `VLLM_R4D_MOE_CFG*`
+knobs below (measured twice back-to-back against `t8b`: -0.54 ms/step on average, 2-4% better
+ms/step at B=2 and B=4, numerics inside the restart-noise floor; see "MoE launch config").
+`t8b` itself is `c8` plus
 `max-num-batched-tokens 4096` and the K3 dispatcher change that routes the shared-expert
 gate GEMV to r4d. Read the prose column honestly: the intermediate arm `t1` (NBT 4096, gate
 still on hipBLASLt) measured 96.2 / 122.8 / 103.4, so the gate change bought +8.0 JSON and
@@ -122,6 +126,18 @@ tune it against your own traffic mix.
 Long context is intact: `bench/needle.py` is **9/9** at 32K / 128K / 200K x depth 10/50/90%,
 the longest prompt being 256,389 tokens.
 
+### MoE launch config and the remaining kernel headroom
+
+The closed MoE grouped GEMM takes a `(WV, SK, NPW)` launch config chosen by the dense kernel's
+picker, which was tuned for M<=64 dense shapes, not 16-row expert blocks. Sweeping it on the
+LRU hot path with real 5-row decode routings (`bench/hotprobe/moe_cfg_sweep.py`) moved gate_up
+from 61.6 to 54.5 us/call with `(1,2,4)` and down from 40.9 to 34.1 us with `(1,1,1)`; in situ
+that is the `cfg` arm above. The same probe against a read-only control on the same bytes puts
+the kernel at 81% (gate_up) / 67% (down) of the achievable read ceiling, so ~1.2 ms/step is all
+any rewrite could still recover; the open bf16 GEMV is at 1.05-1.13x of its control and the
+all-reduce kernel costs 3.2 us/call with the rest of its time being rank skew. Full write-up,
+including why hardware counters are unusable on gfx1201 in this SDK: `docs/HOTPATH.md`.
+
 ### Caveats
 
 * **Restart-to-restart nondeterminism.** Greedy output on this box is stable within a server
@@ -194,6 +210,10 @@ server restarts (see caveats), so differences of a few percent between arms are 
 | `t7b` | c8 + K3 dispatcher fall-through (census arm) | 89.1 | 131.3 | 114.7 | 30.88/30.77/31.51 | 0.438/0.763/0.654 | 3337.8 |
 | `t8b` | c8, NBT 4096, shared_expert_gate GEMV on r4d (launcher default) | 91.4 | 130.8 | 118.7 | 29.48/29.56/30.44 | 0.424/0.719/0.658 | 3538.7 |
 | `t9` | t8b + experimental fp8 skinny kernel (VLLM_HC_FP8SK=1) | 90.5 | 129.2 | 116.3 | 29.16/29.34/29.82 | 0.407/0.698/0.621 | 3513.2 |
+| `cfg124_111` | t8b + VLLM_R4D_MOE_CFG1=1,2,4 CFG2=1,1,1 (pair 1, first) | 94.1 | 128.5 | 121.0 | 29.25/29.24/29.88 | 0.444/0.688/0.655 | 3544 |
+| `cfg_base` | t8b (pair 1, second) | 96.7 | 137.7 | 123.4 | 29.10/29.79/30.58 | 0.451/0.778/0.693 | 3560 |
+| `base2` | t8b (pair 2, first) | 86.6 | 133.0 | 122.3 | 29.55/29.77/30.28 | 0.390/0.741/0.676 | 3484 |
+| `cfg2` | t8b + MoE cfg (pair 2, second) = launcher default | 90.9 | 128.3 | 123.2 | 28.45/29.15/29.88 | 0.394/0.687/0.672 | 3502 |
 
 
 ### Per-step kernel breakdown, baseline vs final
@@ -429,6 +449,8 @@ our test vs 148 with thinking on); `reasoning_effort` and `preserve_thinking` ar
 | `VLLM_R4D_LRU_LANES` | `16` | gather grid.y (concurrent experts) |
 | `VLLM_R4D_HOT_PROFILE` | — | routing-statistics JSON; chooses the per-layer slot budget and the warm start |
 | `VLLM_R4D_HOT_GB` | — | total expert-weight budget per rank, in GB |
+| `VLLM_R4D_MOE_CFG1` | unset (launcher: `1,2,4`) | `wv,sk,npw` launch config of the gate_up grouped MoE GEMM; unset = the dense picker's `(4,8,2)`. Swept in `docs/HOTPATH.md`. |
+| `VLLM_R4D_MOE_CFG2` | unset (launcher: `1,1,1`) | same for the down GEMM; unset = `(8,2,2)`. |
 | `VLLM_R4D_SHARE_A8` | `1` | share the FP8 activation between the shared expert and the routed MoE. Unverified win; `0` in every measured arm. |
 | `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions. `2` casts to fp32 around the fused kernel, matching the stock decomposition up to reduction order, for **-224 kernels/step**; it is the file default and was on in every arm from `combo1` onward. `1` is the original bf16-weight variant, -288/step but it **perturbs ~30% of elements**; `0` is the stock 10-kernel path. See `docs/PATCHES.md` #1. |
 | `VLLM_GDN_STRIDED_QKV` | `0` | strided QKV into the GDN linear attention: -144 copies/step, bit-identical |

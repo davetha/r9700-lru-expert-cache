@@ -84,6 +84,7 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
   -e VLLM_QSA_ROPE_GATHER="${VLLM_QSA_ROPE_GATHER:-1}" \
   -e VLLM_UVA_OFFLOAD_EMBED=1 -e VLLM_UVA_OFFLOAD_VISUAL=1 \
   -e VLLM_DRAFT_W4_LMHEAD="${VLLM_DRAFT_W4_LMHEAD:-1}" \
+  -e VLLM_R4D_MOE_CFG1="${VLLM_R4D_MOE_CFG1:-1,2,4}" -e VLLM_R4D_MOE_CFG2="${VLLM_R4D_MOE_CFG2:-1,1,1}" \
   -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" -v "$REPO_ROOT/templates:/templates:ro" \
   -p "$PORT:8000" $PM ${EXTRA_DOCKER_ARGS:-} \
   "$IMG" "$MODEL" \
