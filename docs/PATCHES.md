@@ -1,17 +1,20 @@
 # k4 kernel-count patches (bind-mountable working copies)
 
-Working copies of fork files, edited in place under `$REPO/patches/`.
-Nothing in `/app`, `$REPO/fork_vllm` or `$HOME/hotcold` was touched.
+Working copies of fork files, edited in place under `patches/`.
+Nothing in `/app`, `fork_vllm` or `<host>/hotcold` was touched.
 Mount list: `MOUNTS.txt` (one `-v` per line, splice into the launcher).
 
 Baseline for every "per step" number below: the production HIP-graph trace census in
-`$REPO/k4/KERNEL_HITLIST.md` — **3490 kernels / 61.9 ms / 47.2 ms busy /
+`k4/KERNEL_HITLIST.md` — **3490 kernels / 61.9 ms / 47.2 ms busy /
 14.7 ms of inter-kernel gap, median gap 3.72 us** for one full decode step (target
 forward + 4 MTP draft iterations + logits + sampler).
 
+Original per-patch estimates, kept for provenance -- superseded by the measured
+status table below.
+
 | # | file | env gate (default) | kernels/step | evidence |
 |---|------|--------------------|--------------|----------|
-| 1 | `model_executor/layers/layernorm.py` | `VLLM_GEMMA_NORM_FUSED=1` | **-288** | measured 10 -> 1 per call |
+| 1 | `model_executor/layers/layernorm.py` | `VLLM_GEMMA_NORM_FUSED` (file default **2**) | **-224** | mode 2, measured 10 -> 3 per call; mode 1 would be -288 but moves 24% of elements |
 | 4a | `model_executor/layers/rotary_embedding/mrope.py`, `models/qwen4_exp/amd/indexer_qsa.py` | none | **-32** | measured 3 -> 2 per call |
 | 5 | `model_executor/kernels/linear/mxfp4/r4dhip.py`, `hotcold/r4d_mxfp4_moe.py` | `VLLM_R4D_SHARE_A8=1` | **-52 (unverified)** | reasoned, not yet traced |
 | 6 | `model_executor/layers/fused_moe/modular_kernel.py` | `VLLM_MOE_OUTPUT_ALIAS=1` | **-48** | removes a measured DtoD/layer |
@@ -23,9 +26,39 @@ forward + 4 MTP draft iterations + logits + sampler).
 | 11 | `model_executor/layers/fused_silu_mul_quant.py`, `hotcold/r4d_mxfp4_moe_lru.py`, `hotcold/r4d_mxfp4_moe.py` | `VLLM_FUSED_SILU_QUANT=1` | **-52** | measured 2 -> 1 per MoE block x 52, bit-identical (proven on device, not argued) |
 | 12 | `model_executor/layers/rotary_embedding/mrope.py`, `models/qwen4_exp/amd/indexer_qsa.py` | `VLLM_QSA_ROPE_GATHER=1` | **-32** | the QSA rope's two cos/sin gathers move inside the mrope kernel; bit-identical on 43 device cases |
 
-Total ~**-420 kernels/step (12%)**, ~**-1.9 ms/step (~3%)** at 3.72 us of gap per kernel
-plus the kernels' own time. Only #1 is measured end to end; treat the rest as estimates
-until a re-profile confirms them.
+### Status after the c7 re-profile (2026-09-04) -- these are measurements now
+
+`prof_c7_rope` (the launcher default: LRU + `MOUNTS_COMBO4` + `VLLM_DRAFT_W4_LMHEAD`
+`VLLM_GDN_STRIDED_QKV` `VLLM_FUSED_SHARED_GATE` `VLLM_FUSED_SILU_QUANT`
+`VLLM_QSA_ROPE_GATHER`) against `prof_lru1`, rank 0, full decode step
+(`k4/prof_diff.py`): **3265 -> 2776 kernels/step, 41.7 -> 36.2 ms/step**.
+`prof_lru1` already mounted `MOUNTS_LRU.txt`, so #1 (mode 2), #4a and #10 are on in
+*both* -- their savings are against the older `prof_base_h15`, not against this pair.
+Of the -489: **-192 is K1's fused LRU manager** (`moe_align_block_size` 96 +
+`count_and_sort_expert_tokens` 96 + `lru_manage_k` 48 -> `lru_fused_k` 48), #8 is
+count-neutral (`wvSplitK_hf_sml_` -4, `r4d_gemm_w4a16_nt_m64` +4), and the remaining
+**-297/step is #2 + #7 + #11 + #12** -- against -301 predicted from their individual
+measurements. Live on that arm: 93.2 prose / 125.9 JSON / 107.4 code tok/s, accept
+rates unchanged.
+
+| # | gate | in the launcher default | kernels/step | numerics |
+|---|---|---|---|---|
+| 1 | `VLLM_GEMMA_NORM_FUSED` (file default 2) | yes | -224 (10 -> 3 per call x 32) | **not** bit-identical: ~3e-6 of elements move 1 bf16 ulp |
+| 2 | `VLLM_GDN_STRIDED_QKV=1` | yes | -144 | bit-identical, proven on device |
+| 4a | none (active whenever `mrope.py` is mounted) | yes | -32 | bit-identical |
+| 7 | `VLLM_FUSED_SHARED_GATE=1` | yes | -52 | bit-identical, proven on device |
+| 8 | `VLLM_DRAFT_W4_LMHEAD=1` | yes | 0 (-2.8 ms/step) | accuracy-affecting by design (W4 draft head) |
+| 10 | none | yes (diagnostics only) | 0 | n/a |
+| 11 | `VLLM_FUSED_SILU_QUANT=1` | yes | -48 | bit-identical, proven on device |
+| 12 | `VLLM_QSA_ROPE_GATHER=1` | yes | -57 net (-32 -24 -26 **+25**) | bit-identical, 43 device cases |
+| 5 | `VLLM_R4D_SHARE_A8=1` | no | -52, never traced | reasoned only |
+| 6 | `VLLM_MOE_OUTPUT_ALIAS=1` | no | -48, never traced | reasoned only |
+| 9 | needs `use_local_argmax_reduction` | no | small (-0.14 ms/step) | bit-identical verdict, unanimous across ranks |
+| P-A | mode 3, one Triton kernel | no -- rejected | -64 | 1 element in 81.8M differs from mode 2 |
+
+Per-family elementwise census before/after (489 -> 255 kernels/step, 907 -> 458 us/step)
+and the three blocks that remain open are in `k4/KERNEL_HITLIST.md`, section
+"Post-c7 census".
 
 ---
 
@@ -122,6 +155,39 @@ reduction is not torch's `.mean(-1)` tree; once in ~1e6 the fp32 rsqrt lands the
 side of a bf16 rounding boundary. Mode 1 moves 30% of elements, so mode 2 is five orders
 of magnitude tighter -- but it is a perturbation, not zero. Decode-sized calls (20 rows)
 came back equal in every probe case.
+
+### P-A: one Triton kernel instead of mode 2's three -- REJECTED (2026-09-04)
+
+Proposal was mode 3: a single Triton kernel (bf16 in, fp32 (1 + w), fp32 math, bf16 out)
+replacing mode 2's cast / fused / cast, -64 launches/step. Gate for shipping it was
+bit-identity with mode 2, the shipped default. **It misses, by one element in 81.8M.**
+
+Reverse-engineering how the closed `vllm_c` kernel sums the 128 squares, against
+`impl.func_impl_fn` in **fp32** (bf16 rounding hides 1-ulp sum differences), 319K real-shaped
+rows x the checkpoint's 26 real indexer q/k_layernorm weights:
+
+| what was tested | probe | verdict |
+|---|---|---|
+| `sum/128 + eps`, `rsqrt`, `(x*inv)*w` | `probe_gemma3.py` | exact -- on integer inputs (sum exact for any order) the kernel matches element for element |
+| `tl.math.rsqrt` vs raw `v_rsq_f32` vs `1/sqrt` | `probe_gemma6.py` | first two identical and correct; `1/sqrt` wrong on 35% of rows |
+| double accumulator, 4 rounding placements | `probe_gemma7.py` | refuted, 16-25% of rows wrong |
+| LLVM contracting `x*x` into the first tree add | `probe_gemma8.py` | refuted, my tree == a torch tree bit for bit |
+| 15 reduction orders (wave32/wave64, adjacent vs halves pairing, serial vs tree fold, float4/float8 per-thread sums) | `probe_gemma4.py`, `probe_gemma5.py` | best is the **adjacent-pair balanced tree over all 128**: 99.74% of rows exact; the rest are 1 ulp of the sum (71 of 72 confirmed by extracting the kernel's own `inv`) |
+
+So the arithmetic is fully known and only the association is not, and no plausible
+association reproduces it. After the bf16 cast the residual nearly vanishes -- but not
+quite:
+
+| single kernel vs mode 2, bf16 out | elements differing |
+|---|---|
+| 3 input scales, 319K rows (`probe_gemma9.py`) | **0** |
+| 6 input scales incl. 0.02 / 64 / 1e-3, 639K rows (`probe_gemma10.py`) | **1 in 81,788,928** (1.2e-8) |
+
+The zero was an artifact of the narrower scale set: widen the inputs and it reappears.
+For scale: that is 118x tighter than the mode 2 vs stock divergence we already ship
+(1.4e-6) and 138x tighter than the same kernel using plain `tl.sum`, but it is not zero,
+so mode 3 is **not implemented**. Reviving it needs either the `vllm_c` source (the wheel
+ships `_C.abi3.so` only, no `csrc`) or an explicit decision to accept a 1e-8 perturbation.
 
 ## #4a mrope: pre-split contiguous cos/sin caches
 
@@ -498,7 +564,7 @@ the profile. ab3, three prompt types:
 | + `VLLM_DRAFT_W4_LMHEAD=1` | 31.9 / 32.1 / 31.1 | 0.421 / 0.706 / 0.530 | 84.5 / 119.4 / 100.3 |
 
 So the acceptance cost is real (-3 to -9% relative) but smaller than the step saving:
-**net +4 to +8% tok/s**. Adopted in `$HOME/launch_q38fn_lru.sh`. This is why the arm
+**net +4 to +8% tok/s**. Adopted in `<host>/launch_q38fn_lru.sh`. This is why the arm
 has to be read on both numbers -- on ms/step alone the win would have looked like 9%.
 
 ### `VLLM_DRAFT_HS_DUMP` -- capture real draft hidden states (default off)
@@ -524,8 +590,8 @@ what the env says -- that is why those two have never been measured live. `MOUNT
 is COMBO2 plus exactly those four (`qwen_gdn_linear_attn.py`, `fused_sigmoid_gating.py`,
 `fused_gate_mul.py`, `qwen2_moe.py`); COMBO2 is untouched. To measure them:
 
-    MOUNTS_FILE=$REPO/patches/MOUNTS_COMBO3.txt \
-      $HOME/launch_q38fn_lru.sh 15.0     # with -e VLLM_GDN_STRIDED_QKV=1 \
+    MOUNTS_FILE=patches/MOUNTS_COMBO3.txt \
+      <host>/launch_q38fn_lru.sh 15.0     # with -e VLLM_GDN_STRIDED_QKV=1 \
                                               #      -e VLLM_FUSED_SHARED_GATE=1
 
 Both are bit-identical by construction (no numerics change, only fewer launches), so
@@ -792,9 +858,9 @@ if a numerics change is on the table for other reasons.
 `MOUNTS_COMBO4.txt` = `MOUNTS_COMBO3.txt` + the new kernel file:
 
 ```
-MOUNTS_FILE=$REPO/patches/MOUNTS_COMBO4.txt \
+MOUNTS_FILE=patches/MOUNTS_COMBO4.txt \
 EXTRA_DOCKER_ARGS="-e VLLM_GDN_STRIDED_QKV=1 -e VLLM_FUSED_SHARED_GATE=1 -e VLLM_FUSED_SILU_QUANT=1" \
-  $HOME/launch_q38fn_lru.sh 15.0
+  <host>/launch_q38fn_lru.sh 15.0
 ```
 
 The launcher already mounts `hotcold/r4d_mxfp4_moe_lru.py` by default, so no
@@ -844,6 +910,25 @@ allocations per call inside the graph pool.
 one. Every case `torch.equal` on both q and k, and a control asserts the kernel
 actually rotated (`changed=True`). The kernel loads the same bytes it used to load;
 no arithmetic changed. Two of those cases are in `k4/smoke_imports.py`.
+
+### Measured in the adopted arm (`prof_c7_rope` vs `prof_c4`, rank 0, full step)
+
+| kernel | delta/step | |
+|---|---|---|
+| `vectorized_gather_kernel` | -32 | the cos/sin gathers |
+| `index_elementwise_kernel<..., OpaqueType<2>>` | -24 | |
+| `direct_copy` bf16 (`elementwise_kernel_manual_unroll`) | -26 | `triton_mrope`'s `cos.contiguous()`/`sin.contiguous()`: the whole caches are already contiguous |
+| `direct_copy` int64 | **+25** | the new `positions.contiguous()`, see below |
+| **net** | **-57** | matches the -56 measured for the pair once #11's -48 is removed |
+
+`canonical_qsa_rope_positions` builds `positions` with `expand(3, -1)` (stride 0 on the
+broadcast axis), so the `.contiguous()` the kernel's row-major pointer arithmetic needs
+materialises a real `[3, T]` int64 copy on every call -- ~16 calls/step. It is the same
+tensor every time, so hoisting one `.contiguous()` per forward, or giving the kernel a
+positions stride (the trick that made #2 work), would recover ~24 launches/step. Not
+done: it needs its own bit-identity probe. Counted in `k4/mu.py`, written up in
+`k4/KERNEL_HITLIST.md` under "Post-c7 census".
+
 
 ### Guards
 

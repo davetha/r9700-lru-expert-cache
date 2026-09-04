@@ -23,7 +23,7 @@ every launch) — aligned kernel-for-kernel.
    The 860 eager kernels with no production twin are exactly the ones inductor *did* fuse.
 5. `hitlist.py` / `perlayer.py` — the tables below.
 
-Scripts: `$REPO/k4/{extract,attrib,align,hitlist,perlayer,graph_census,seq_eager,seq_graph,cmp_eager_graph,regions}.py`.
+Scripts: `k4/{extract,attrib,align,hitlist,perlayer,graph_census,seq_eager,seq_graph,cmp_eager_graph,regions}.py`.
 Intermediates: `step_eager_r0.pkl`, `full_eager_r0.pkl`, `full_eager_r0_attr.pkl`, `aligned.pkl`.
 Raw output: `HITLIST_RAW.txt`, `align_out.txt`, `attrib_out.txt`.
 
@@ -173,7 +173,7 @@ Legend: **P** = Python-only (cheap), **K** = needs a new/modified kernel (expens
 | 1a | *If #1's numerics are rejected*: keep fp32 weight but still precompute it once. | `layers/layernorm.py:157` | −64 | −0.30 | **P**, no numerics change |
 | 2 | **GDN qkv repack.** `rearrange_mixed_qkv` does 3 `reshape(-1)` copies **plus** a `torch.cat` — 4 full-qkv copies per GDN layer. (Its docstring claims torch.compile emits one Triton kernel; the production trace shows 3 `elementwise_manual_unroll` + 1 `CatArrayBatchedCopy`.) Best fix: pass strided q/k/v straight to `fused_sigmoid_gating_delta_rule_update` (FLA kernels take strides). | `mamba/gdn/qwen_gdn_linear_attn.py:778-810` | **−144** | **−0.81** | K (kernel signature) |
 | 2a | *Fallback*: one repack kernel `[seq,D] → 3 contiguous blocks` instead of 4 launches. | same | −108 | −0.58 | K (small) |
-| 3 | **Dedup the hot/cold `moe_align_block_size`.** `_apply_split` calls it twice on the *same* `topk_ids` with complementary expert maps → 4 kernels/layer. One kernel can emit both subsets' sorted buffers in a single counting pass. | `$HOME/hotcold/r4d_mxfp4_moe.py:422-425`; `_custom_ops.py:2254` | **−96** | **−0.55** | K |
+| 3 | **Dedup the hot/cold `moe_align_block_size`.** `_apply_split` calls it twice on the *same* `topk_ids` with complementary expert maps → 4 kernels/layer. One kernel can emit both subsets' sorted buffers in a single counting pass. | `patches/hotcold/r4d_mxfp4_moe.py:422-425`; `_custom_ops.py:2254` | **−96** | **−0.55** | K |
 | 4 | **mrope: stop materialising cos/sin.** `triton_mrope` does `cos.contiguous(); sin.contiguous()` on views produced by `cos_sin.chunk(2,-1)` (2 copies per call), preceded by a `cache[positions]` gather. Pass `cos_sin_cache` + `positions` into the Triton kernel and gather/split inside. | `rotary_embedding/mrope.py:193-196`; `indexer_qsa.py:30-45` | **−88** | **−0.49** | K (small Triton) |
 | 4a | *Python-only variant*: keep cos and sin in two separate contiguous caches (2 gathers, 0 copies). | rotary-embedding cache init | −28 | −0.15 | **P** |
 | 5 | **Shared expert re-quantises the routed activation.** `qwen3_next.py:200` passes the same tensor as `hidden_states` and as the shared-expert input; the routed path quantises it at `r4d_mxfp4_moe.py:426` and `_r4d_mxfp4_linear` quantises it *again* at `r4dhip.py:105`. Plumb the existing `(qx, xs)` into the shared expert's first GEMM. | `models/qwen3_next.py:200`; `hotcold/r4d_mxfp4_moe.py:426`; `kernels/linear/mxfp4/r4dhip.py:105` | **−48** | **−0.26** | **P** (plumbing) |
@@ -236,3 +236,89 @@ pins the rms_norm IR op to `['native']` under inductor, and the fused impl we ca
 its place only takes fp32, so the two casts are a dtype boundary, not a missed fusion.
 
 **Post-c4/c6 remainder: ~277 kernels/step, ~535 us/step**, and ~245/step after #12.
+
+## P-A closed: single-kernel GemmaRMSNorm -- REJECTED (2026-09-04)
+
+-64 launches/step, but not bit-identical to the shipped mode 2: **1 element in 81.8M**
+(6 input scales, 639K rows, `probe_gemma10.py`). A 3-scale probe said 0 (`probe_gemma9.py`)
+-- widen the input scales and it comes back, so do not trust the narrower run.
+The vllm_c arithmetic is fully pinned (`sum/128 + eps`, `rsqrt`, `(x*inv)*w`, all exact);
+only the 128-term reduction ASSOCIATION is unknown, and none of 15 candidate orders
+reproduces it (best: adjacent-pair balanced tree, 99.74% of rows). Probes 3-10 in `k4/`.
+Full write-up: `patches/PATCHES.md`, section "P-A".
+
+## Post-c7 census (2026-09-04, `prof_c7_rope` rank 0, 84 decode steps, ALL gates on)
+
+Arm c7 = the launcher default (LRU + `MOUNTS_COMBO4` + #8 W4 draft head + #2 GDN strided
++ #7 fused shared gate + #11 fused silu-quant + #12 QSA rope gather). Live: 93.2 prose /
+125.9 JSON / 107.4 code tok/s, accept rates identical to c4.
+
+**Full decode step (`k4/prof_diff.py`, annotation -> next annotation, rank 0):**
+
+| arm | kernels/step | ms/step |
+|---|---|---|
+| `prof_lru1` (LRU only, k4 env gates off, `MOUNTS_LRU` mounted) | 3265 | 41.7 |
+| `prof_c4` | 2880 | 36.7 |
+| `prof_c7_rope` | **2776** | **36.2** |
+
+`prof_lru1 -> prof_c7_rope` is **-489 kernels/step**. -192 of that is K1's fused LRU
+manager (`moe_align_block_size` 96 + `count_and_sort_expert_tokens` 96 + `lru_manage_k` 48
+-> `lru_fused_k` 48) and the W4 draft head is count-neutral (`wvSplitK_hf_sml_` -4,
+`r4d_gemm_w4a16_nt_m64` +4). **The remaining -297/step is #2 + #7 + #11 + #12**, against -301 predicted from their
+individual measurements. `prof_lru1` already mounted `MOUNTS_LRU.txt`, so #1 (mode 2),
+#4a and #10 are on in *both* arms and do not appear in this delta.
+
+**Elementwise family (`k4/eattrib.py`, same 84 steps, `k4/ediff.py` for the diff):**
+
+| | kernels/step | us/step | distinct name+grid |
+|---|---|---|---|
+| `prof_w4head` (c4/c6 gates off) | 489.4 | 907.4 | 102 |
+| `prof_c7_rope` (all gates on) | **255.0** | **457.8** | 100 |
+
+That is **-234/step and -450 us/step**, against the -244 predicted in the census above.
+Per family (`+` = new, `-` = removed):
+
+| family | before/step | after/step | delta | by |
+|---|---|---|---|---|
+| `direct_copy` bf16 | 153.4 | 22.0 | **-131.4** | #2 GDN strided qkv (-108 copies -36 cat) + #12 (-26 cos/sin `.contiguous()`) |
+| `MulFunctor` bf16 | 69.0 | 17.0 | **-52.0** | #7 fused shared gate |
+| `sigmoid` bf16 | 52.0 | 0.0 | **-52.0** | #7 |
+| `index OpaqueType<2>` | 33.0 | 9.0 | **-24.0** | #12 |
+| `direct_copy` int64 | 6.7 | 31.7 | **+25.0** | #12, see below |
+| bf16<->fp32 casts | 64.0 | 64.0 | 0 | #1 mode 2's dtype boundary, still open |
+| `FillFunctor` bf16 | 19.8 | 19.8 | 0 | P-B (QSA output zero-fill), withdrawn |
+| PLE index math (arange/where/clamp/sub/cat on long) | ~30 | ~30 | 0 | P-C, not now |
+| everything else | ~61 | ~61 | 0 | eager input-prep + sampler, outside the graph |
+
+### The one new item: #12 pays 25 int64 copies/step for the 26 bf16 copies it removes
+
+`elementwise_kernel_manual_unroll` variants in ONE step (`k4/mu.py`):
+
+| variant | c4 | c7 |
+|---|---|---|
+| `direct_copy` bf16 | 48 | 22 |
+| `direct_copy` int64 | 5 | 30 |
+| MulFunctor / Half / int / other | 31 | 31 |
+
+`canonical_qsa_rope_positions` returns `positions.unsqueeze(0).expand(3, -1).transpose(0, 1)...`
+-- stride 0 on the broadcast axis -- so the `positions = positions.contiguous()` that
+`triton_mrope` needs for its row-major pointer arithmetic materialises a real `[3, T]`
+int64 copy on **every** call: ~16 calls/step (12 QSA layers + 4 MTP drafts) plus MTP
+re-entries = +25/step. The full-step ledger for #12 is therefore
+`-32 vectorized_gather, -24 index_elementwise, -26 bf16 contiguous, +25 int64 = -57/step`,
+which is exactly the -56 measured for the c4 -> c7 pair once #11's -48 is taken out. The
+patch is still a clear win and the live arm confirms it.
+
+**Open, cheap:** every one of those 25 copies materialises the *same* tensor. Hoisting
+one `.contiguous()` per forward (or, better, giving the kernel a positions stride
+parameter -- the same trick that fixed #2, where the FLA wrapper's `.contiguous()` was
+the whole cost) would recover ~24 launches/step. Not implemented: out of scope for the
+patch as adopted, and it needs its own bit-identity probe.
+
+### Remaining elementwise budget after c7
+
+255/step, 458 us/step. The three biggest open blocks are unchanged in kind:
+**64/step bf16<->fp32 casts** around the fused rms_norm (#1 mode 2's dtype boundary --
+P-A tried to remove them with one Triton kernel and was rejected on numerics, previous section),
+**~30/step PLE index math**, **~20/step QSA `FillFunctor`**. All three are eager-region
+kernels, not missed inductor fusions.
