@@ -153,13 +153,13 @@ the longest prompt being 256,389 tokens.
 ## Benchmark log
 
 Every A/B arm of the campaign, in chronological order. All runs: 2x R9700 (gfx1201) TP=2,
- image, greedy, MTP-4 unless stated, ,
- unless stated, single stream,  best-of-3 (256 / 800 / 600
+`local/q38fn-rocm10:try1` image, greedy, MTP-4 unless stated, `max-model-len 262144`,
+`max-num-seqs 4` unless stated, single stream, `bench/ab3.py` best-of-3 (256 / 800 / 600
 output tokens for the prose / JSON / code prompts). ms/step is wall time divided by the
- delta, i.e. one target-verify forward plus its 4 draft
+`vllm:spec_decode_num_drafts_total` delta, i.e. one target-verify forward plus its 4 draft
 passes; it is the metric to compare kernel changes on, because any numerics change alters the
-greedy text and therefore the MTP acceptance rate and tok/s.  is accepted / drafted
-tokens. Prefill is a 12.5K-token prompt with  (the probe was added mid-campaign,
+greedy text and therefore the MTP acceptance rate and tok/s. `accept` is accepted / drafted
+tokens. Prefill is a 12.5K-token prompt with `max_tokens 1` (the probe was added mid-campaign,
 so early arms have no prefill figure). Greedy output on this box is not reproducible across
 server restarts (see caveats), so differences of a few percent between arms are noise.
 
@@ -200,7 +200,7 @@ server restarts (see caveats), so differences of a few percent between arms are 
 
 Median full decode step (target forward + 4 MTP drafts + sampler) from the torch profiler,
 rank 0, top 12 kernels by time. The profiler adds ~2 us per launch, so these step times are
-~15-20% above the unprofiled  in the table above; the proportions are what matter.
+~15-20% above the unprofiled `ms/step` in the table above; the proportions are what matter.
 
 **baseline** (`prof_base_h15`): full decode step 55.0 ms under the profiler, 3490 kernel launches, 40.5 ms kernel-busy
 
@@ -238,17 +238,17 @@ rank 0, top 12 kernels by time. The profiler adds ~2 us per launch, so these ste
 
 
 The MoE grouped GEMM line is the LRU cache: 19.3 ms of cold-expert PCIe reads at 28.4 GB/s
-became 5.1 ms of resident GEMM plus 1.4 ms of  misses.  (the
-hyper-connection bf16 GEMMs) moved to ; the  hipBLASLt line
-(the 2560 -> 1 shared-expert gate) is gone; the four  launches are
+became 5.1 ms of resident GEMM plus 1.4 ms of `lru_gather_k` misses. `wvSplitK` (the
+hyper-connection bf16 GEMMs) moved to `r4d_gemm_bf16_nt_m64`; the `Cijk` hipBLASLt line
+(the 2560 -> 1 shared-expert gate) is gone; the four `r4d_gemm_w4a16_nt_m64` launches are
 the W4 draft lm_head replacing four ~1 ms bf16 GEMMs that ran outside the annotated forward.
 
 ### Concurrency
 
-, B simultaneous streams of 500 tokens on different prompts,
+`bench/concurrent_bench.py`, B simultaneous streams of 500 tokens on different prompts,
 aggregate tok/s and steady-state ms/step (engine steps = drafts delta / running requests):
 
-| streams | static hot set | LRU only ( stack) | full stack () |
+| streams | static hot set | LRU only (`lru1` stack) | full stack (`c8`) |
 |---|---|---|---|
 | B=1 | 76.6 (37.9 ms/step) | 94.0 (33.7) | 105.7 (29.9) |
 | B=2 | 88.6 (58.8) | 114.9 (45.5) | — |
@@ -256,26 +256,26 @@ aggregate tok/s and steady-state ms/step (engine steps = drafts delta / running 
 
 ### Long-context correctness
 
-: a 3-field needle (name / part number / ticket id) at 10 / 50 / 90 % depth
+`bench/needle.py`: a 3-field needle (name / part number / ticket id) at 10 / 50 / 90 % depth
 of 32K, 128K and 200K-line documents, prompts of 36,442 / 148,889 / 256,389 tokens.
-**9/9 PASS** on the LRU stack () and again on the full stack (); the same 9/9
+**9/9 PASS** on the LRU stack (`lru1`) and again on the full stack (`combo1`); the same 9/9
 held on the static-hot-set baseline.
 
 ### Numerics probes
 
- (teacher-forced prompt logprobs on fixed 260-800-token texts) and
- (greedy decode logprobs), mean |dlogprob| per token:
+`bench/lpprobe.py` (teacher-forced prompt logprobs on fixed 260-800-token texts) and
+`bench/genprobe.py` (greedy decode logprobs), mean |dlogprob| per token:
 
 | pair | prose | code | json |
 |---|---|---|---|
 | two LRU=0 servers, identical config (restart noise floor) | 0.064 | 0.020 | 0.016 |
-| LRU=0 vs LRU=1 with  (cache machinery on, no inserts) | 0.000 | 0.010 | 0.015 |
+| LRU=0 vs LRU=1 with `MAX_INSERTS=0` (cache machinery on, no inserts) | 0.000 | 0.010 | 0.015 |
 | LRU=0 vs LRU=1 | 0.13 | 0.018 | 0.028 |
 
 The LRU's excess over the restart floor is a uniform scale factor across the distribution
 (partition churn: the same rows are computed by the resident and the fallback call on
 different steps), not a tail — a wrong expert would show as a heavy tail. The kernel-level
-tests (, ) are bit-exact.
+tests (`tests/lru/test_numerics_prod.py`, `test_slots_prod.py`) are bit-exact.
 
 ## How it works
 
