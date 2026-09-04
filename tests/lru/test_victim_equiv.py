@@ -17,8 +17,8 @@ import sys
 import numpy as np
 import torch
 
-OLD = os.environ.get("OLD_LIB", "/w/build/kernels/librlu_fused.so")
-NEW = os.environ.get("NEW_LIB", "/w/build/kernels/librlu_v2.so")
+OLD = os.environ.get("OLD_LIB", "/w/build/kernels/librlu_old.so")
+NEW = os.environ.get("NEW_LIB", "/w/build/kernels/librlu.so")
 DEV = "cuda"
 BLOCK = 16
 FAIL = 0

@@ -21,6 +21,7 @@ forward + 4 MTP draft iterations + logits + sampler).
 | 8 | `models/qwen4_exp/amd/mtp.py` + K3's `model_executor/kernels/draft_w4_lmhead.py` | `VLLM_DRAFT_W4_LMHEAD=1` | 0 | not a kernel count: -2.8 ms/step measured in production, **net +4-8% tok/s** after the acceptance-rate cost |
 | 9 | `models/qwen4_exp/amd/mtp.py` | none (needs `use_local_argmax_reduction` in the speculative config) | small | replaces a 248320-column all-gather with a (value, index) reduction, ~-0.14 ms/step |
 | 11 | `model_executor/layers/fused_silu_mul_quant.py`, `hotcold/r4d_mxfp4_moe_lru.py`, `hotcold/r4d_mxfp4_moe.py` | `VLLM_FUSED_SILU_QUANT=1` | **-52** | measured 2 -> 1 per MoE block x 52, bit-identical (proven on device, not argued) |
+| 12 | `model_executor/layers/rotary_embedding/mrope.py`, `models/qwen4_exp/amd/indexer_qsa.py` | `VLLM_QSA_ROPE_GATHER=1` | **-32** | the QSA rope's two cos/sin gathers move inside the mrope kernel; bit-identical on 43 device cases |
 
 Total ~**-420 kernels/step (12%)**, ~**-1.9 ms/step (~3%)** at 3.72 us of gap per kernel
 plus the kernels' own time. Only #1 is measured end to end; treat the rest as estimates
@@ -98,6 +99,29 @@ N >= ln(1-B)/ln(1-p_min). `VLLM_GEMMA_NORM_FUSED=0` restores the stock path bit-
 If the numerics are unacceptable, the accuracy-preserving version of this win is a
 Gemma-specific fused kernel that keeps the `+1` in fp32 inside the kernel — a new kernel,
 not a Python change.
+
+### Mode 2 (the shipped default) -- measured, 2026-09-04
+
+`VLLM_GEMMA_NORM_FUSED` defaults to **2**: cast x to fp32, call the fused kernel with an
+fp32 `(1 + w)` (so its dtype guard passes without rounding the weight), cast back.
+10 -> 3 kernels per call, -224/step.
+
+It is **not** bit-identical to stock, and the earlier "same arithmetic, so the text is
+unchanged" note in the file header was too strong. `k4/probe_gemma1.py`, H=128, eps 1e-6,
+against the stock decomposition:
+
+| rows | elements differing, mode 2 vs stock |
+|---|---|
+| 1, 20 | none |
+| 2048 | 1 in 262144 |
+| 65536 | 12 in 8388608 |
+| 4096, larger weights | 1 in 524288 |
+
+~3e-6 of elements move by one bf16 ulp, because the fused kernel's fp32 variance
+reduction is not torch's `.mean(-1)` tree; once in ~1e6 the fp32 rsqrt lands the other
+side of a bf16 rounding boundary. Mode 1 moves 30% of elements, so mode 2 is five orders
+of magnitude tighter -- but it is a perturbation, not zero. Decode-sized calls (20 rows)
+came back equal in every probe case.
 
 ## #4a mrope: pre-split contiguous cos/sin caches
 
@@ -777,3 +801,70 @@ The launcher already mounts `hotcold/r4d_mxfp4_moe_lru.py` by default, so no
 extra mount is needed for the wiring itself. Being bit-identical, this arm must
 move ms/step with `spec_decode_num_accepted` FLAT; if acceptance moves, the
 rounding drifted and the smoke assertion is the place to look.
+
+
+## #12 QSA rope gather folded into the mrope kernel -- `VLLM_QSA_ROPE_GATHER=1` (2026-09-04, default 0)
+
+`model_executor/layers/rotary_embedding/mrope.py` (kernel + wrapper),
+`models/qwen4_exp/amd/indexer_qsa.py` (call site).
+
+### What it replaces
+
+`apply_qsa_rope` gathers the rope rows for this step and hands the result to the
+Triton kernel:
+
+```python
+cos_cache, sin_cache = cos_sin_halves(rotary_emb, tensor)
+cos, sin = cos_cache[positions], sin_cache[positions]   # 2 index kernels + 2 buffers
+tensor, _ = triton_mrope(..., cos, sin, ...)
+```
+
+The kernel already computes a per-token row base (`t_cos = cos + pid * half_rd`).
+With `positions=` it takes that base from `positions` [3, num_tokens] instead, so
+`cos`/`sin` can be the whole caches and the two gathers disappear. `#4a` had turned
+one gather plus two `.contiguous()` copies into two gathers; this removes what was
+left of them.
+
+### Counts (measured, `prof_w4head` rank 0, 84 decode steps)
+
+| kernel | count | /step | what it is |
+|---|---|---|---|
+| `index_elementwise_kernel<..., OpaqueType<2>>` | 2718 | **32.36** | exactly 16 `apply_qsa_rope` calls/step (12 QSA layers + 4 MTP drafts) x 2 gathers |
+
+Each one is 2.83 us of GPU time for a `[3, T, 32]` bf16 gather at T~5 -- launch
+latency, not bandwidth. **-32 launches/step, -92 us/step**, and two fewer
+allocations per call inside the graph pool.
+
+### Bit-identical, proven on device
+
+`k4/probe_rope_gather.py`, on GPU 1 in the image: 43 cases at the real QSA geometry
+(head_dim 128, rotary_dim 64, mrope_section [11, 11, 10]) across T in
+{1, 5, 17, 64, 2048}, n_qh in {4, 1}, both `is_neox_style` and both
+`mrope_interleaved`, plus a transposed (non-contiguous) `positions` and an int32
+one. Every case `torch.equal` on both q and k, and a control asserts the kernel
+actually rotated (`changed=True`). The kernel loads the same bytes it used to load;
+no arithmetic changed. Two of those cases are in `k4/smoke_imports.py`.
+
+### Guards
+
+- `VLLM_QSA_ROPE_GATHER` defaults to 0; without it the call site is the old two-gather path.
+- `positions=` defaults to `None` in `triton_mrope`, so every existing caller
+  (including `MRotaryEmbedding.forward_cuda`) is bit-for-bit unchanged.
+- The indexer never hard-depends on the new keyword: `_rope_gather_supported()`
+  inspects `triton_mrope`'s signature once and warns, keeping the stock path, if an
+  unpatched `mrope.py` is mounted.
+- Only the `positions.ndim == 2` (mrope) branch folds; the 1-D branch feeds
+  `apply_rotary_emb`, which needs materialised cos/sin.
+- `normalize_compressed_keys` hands over a transposed `first_rope_positions`, so the
+  wrapper calls `.contiguous()` on `positions` -- the kernel's pointer arithmetic
+  assumes row-major [3, num_tokens]. Covered by the transposed probe cases.
+
+### Recipe
+
+No new mount: both files are already in `MOUNTS_COMBO4.txt`.
+
+```
+EXTRA_DOCKER_ARGS="... -e VLLM_QSA_ROPE_GATHER=1"
+```
+
+Bit-identical, so ms/step must fall with `spec_decode_num_accepted` FLAT.

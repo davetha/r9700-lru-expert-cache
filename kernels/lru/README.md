@@ -100,3 +100,27 @@ flock -w 3600 $REPO/gpu.lock docker run --rm --ipc host --group-add video \
 * The victim search is `nins` rounds of a block argmin, ~10 barriers each. Bounded by
   `MAX_INSERTS`; a burst step pays for it.
 * Not measured in a live server: no needle test, no ab3, no tok/s.
+
+---
+
+## Since this README was written: the v2 victim selection
+
+`r4d_lru.hip` here is the current source and it supersedes the "Known limits" note about
+the victim search costing `nins` rounds of a block argmin. The serial argmin had a latency
+cliff — 18.6 us at 13 inserts, 43.4 us at 14, 224.9 us at 64, for S=257 — and B=4 runs
+5-13 inserts/layer/step, right underneath it. `pickVictims` now builds one key per slot in
+LDS and ranks each evictable slot against that array, which is a fixed ~3.7 us regardless
+of insert count, and the `nins` updates then run in parallel. Ranking is a regression below
+~4 inserts so short lists keep the serial argmin (`NSER 4`); both paths are in the same
+function and produce identical state. Flat 7-13 us across 0-64 inserts. Numbers and the
+equivalence argument: `../../docs/K1_PROGRESS.md` Task I(a).
+
+`build.sh` produces **one** `librlu.so` exporting all three entry points —
+`r4d_lru_manage`, `r4d_lru_gather` and `r4d_lru_fused` — so `VLLM_R4D_LRU=1` and
+`VLLM_R4D_LRU_FUSE=1` both work against the same file. (The working tree it came from had
+three separate builds, `librlu.so` / `librlu_fused.so` / `librlu_v2.so`, only because the
+older ones were mmapped by running servers and could not be overwritten.)
+
+`r4d_lru_pre_victim.hip` is the pre-rewrite source, kept only so
+`../../tests/lru/test_victim_equiv.py` has an `OLD_LIB` to compare against. Do not run it
+in production.

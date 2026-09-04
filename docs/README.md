@@ -27,6 +27,7 @@ Data artifacts the documents cite — `routes_rank*.npz`, `aligned.pkl`, `tensor
 | document | what it is |
 |---|---|
 | `LOCALITY.md` | the routing-locality analysis that predicted the LRU win, and the simulator results |
+| `K1_PROGRESS.md` | K1's full working log: the LRU design, the victim-selection rewrite and its equivalence proof (Task I(a)), what each MTP draft row costs in cold traffic (I(b)), and why no prefetch predictor beats LRU residency (I(c)) |
 | `FUSE.md` | folding the manager and both `moe_align_block_size` calls into one kernel |
 | `COLD_TRANSFER.md` | measuring the PCIe/UVA cold path: what the gather costs and where its ceiling is |
 | `PATCHES.md` | every patch in `patches/`: what it changes, its env gate, kernels saved, evidence |

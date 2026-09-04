@@ -207,3 +207,32 @@ Per iteration: 20 kernels of QSA `GemmaRMSNorm` decomposition (proposal #1 appli
 Notably the draft's MoE takes the **Triton `fused_moe_kernel`** path
 (`fused_moe/fused_moe.py:763`), not the r4d grouped GEMM — 2 launches/iteration, ~40 µs each.
 Nothing in the draft loop is wasteful by a factor; it is the same per-layer overhead run 4×.
+
+## Elementwise census (2026-09-04, `prof_w4head` rank 0, 84 decode steps, c4/c6 gates OFF)
+
+`k4/eattrib.py` groups every `*elementwise_kernel*` in a kineto trace by full
+templated name + grid; `k4/eattrib2.py` gives each group a Python call site from
+`aligned.pkl` (the eager<->graph alignment). Totals: **489.4 kernels/step, 907 us/step,
+102 distinct (name, grid)**. With `CatArrayBatched` folded in it is 741/step in the
+older `prof_base_h15` step used for attribution.
+
+| group | /step | us/step | call site | status |
+|---|---|---|---|---|
+| `direct_copy` bf16 | 150.5 | 281 | GDN qkv repack `qwen_gdn_linear_attn.py:778` (108) + `indexer_qsa.py:150 project_qk` (12) + `clav_all_gather.py:86` (5) | 108+36 cat removed by #2 |
+| `MulFunctor` bf16 | 68.9 | 131 | shared expert `qwen2_moe.py:110` (52) + ~17 elsewhere | 52 removed by #7 |
+| `sigmoid` bf16 | 52.0 | 71 | same shared-expert site | removed by #7 |
+| `index OpaqueType<2>` | 32.4 | 92 | `indexer_qsa.py:30 apply_qsa_rope` cos/sin gathers, 16 calls x 2 | removed by **#12** |
+| bf16->fp32 + fp32->bf16 | 62.8 | 85 | #1 mode-2's casts around the fused rms_norm, 32 calls/step | **open** (P-A below) |
+| `FillFunctor` bf16 | 18.6 | 18 | `qsa.py:138 forward_qsa` output zero-fill, 16/step | **open** (P-B) |
+| `add` bf16 | 8.0 | 11 | residual adds outside compiled regions | open, small |
+| PLE index math | ~30 | ~45 | `ple_layer.py:999 _short_conv_dilated_spec` (arange/where/clamp/sub/cat on long) | **open** (P-C) |
+| eager input-prep + sampler | ~35 | ~90 | `gdn_attn.py:210 build`, `short_conv_attn.py:243 build`, `model_state.py:65 _prepare_ngram_context`, `rejection_sampler.py:249`, `speculator.py:419/555` | open; outside the graph, so real CPU launches |
+
+**Why inductor leaves them.** Every one of these carries an aten kernel name, not
+`triton_poi_*`: they sit in eager regions outside the compiled model region -- the QSA
+indexer, the PLE, the GDN wrapper, and the input-prep/sampler code that runs before and
+after the graph. The rms_norm casts are a second mechanism: `platforms/rocm.py:1130`
+pins the rms_norm IR op to `['native']` under inductor, and the fused impl we call in
+its place only takes fp32, so the two casts are a dtype boundary, not a missed fusion.
+
+**Post-c4/c6 remainder: ~277 kernels/step, ~535 us/step**, and ~245/step after #12.

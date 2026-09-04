@@ -66,6 +66,8 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
   -e R4D_LRU_LIB="$LRU_LIB" -e VLLM_R4D_SHARE_A8="${VLLM_R4D_SHARE_A8:-0}" \
   -e VLLM_GDN_STRIDED_QKV="${VLLM_GDN_STRIDED_QKV:-0}" \
   -e VLLM_FUSED_SHARED_GATE="${VLLM_FUSED_SHARED_GATE:-0}" \
+  -e VLLM_FUSED_SILU_QUANT="${VLLM_FUSED_SILU_QUANT:-0}" \
+  -e VLLM_QSA_ROPE_GATHER="${VLLM_QSA_ROPE_GATHER:-0}" \
   -e VLLM_UVA_OFFLOAD_EMBED=1 -e VLLM_UVA_OFFLOAD_VISUAL=1 \
   -e VLLM_DRAFT_W4_LMHEAD="${VLLM_DRAFT_W4_LMHEAD:-0}" \
   -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" -v "$PROF_DIR:/prof" \

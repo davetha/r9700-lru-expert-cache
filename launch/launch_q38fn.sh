@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Launch Qwen3.8-Flash-Next on 2x R9700 with the device-side LRU expert cache and the
-# kernel-count patches. This is the "c4" configuration: 89.4 / 122.2 / 105.8 tok/s
-# (prose / JSON / code), MTP-4, 256K context, prefill ~3200 tok/s.
+# kernel-count patches. Every gate that measured a win is on. This is the "c8" arm:
+# 91.8 / 124.1 / 106.2 tok/s (prose / JSON / code), MTP-4, 256K context, prefill ~3170,
+# and 105.7 / 165.7 aggregate at B=1 / B=4.
+#
+# NOTE: this does NOT pin VLLM_GEMMA_NORM_FUSED, so the patched layernorm.py picks its own
+# default (currently 2 = fp32-weight fused norm). Every arm in the README's table ran
+# BEFORE that default existed, i.e. with the fused norm off. Export
+# VLLM_GEMMA_NORM_FUSED=0 to reproduce them exactly.
 #
 #   $1  LRU slot budget in GB of expert weights per rank (default 15)
 #   $2  max model len (default 262144)
@@ -65,6 +71,8 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
   -e R4D_LRU_LIB="$LRU_LIB" -e VLLM_R4D_SHARE_A8="${VLLM_R4D_SHARE_A8:-0}" \
   -e VLLM_GDN_STRIDED_QKV="${VLLM_GDN_STRIDED_QKV:-1}" \
   -e VLLM_FUSED_SHARED_GATE="${VLLM_FUSED_SHARED_GATE:-1}" \
+  -e VLLM_FUSED_SILU_QUANT="${VLLM_FUSED_SILU_QUANT:-1}" \
+  -e VLLM_QSA_ROPE_GATHER="${VLLM_QSA_ROPE_GATHER:-1}" \
   -e VLLM_UVA_OFFLOAD_EMBED=1 -e VLLM_UVA_OFFLOAD_VISUAL=1 \
   -e VLLM_DRAFT_W4_LMHEAD="${VLLM_DRAFT_W4_LMHEAD:-1}" \
   -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" \

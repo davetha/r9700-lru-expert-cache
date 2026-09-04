@@ -18,22 +18,73 @@ Measured effect on the production trace: PCIe expert traffic falls from 432 MB/s
 Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max-num-seqs 4`,
 `max-num-batched-tokens 2048`. tok/s is best-of-3 from `bench/ab3.py`.
 
-| arm | prose | JSON | code | source |
-|---|---|---|---|---|
-| baseline (static hot set, ROCm 10 image) | 60.2 | 68.6 | 89.1 | `ab3_r10_base_h15` |
-| + LRU expert cache | 76.7 | 112.6 | 94.1 | `ab3_lru1` |
-| + W4 draft LM head | 84.5 | 119.4 | 100.3 | `ab3_w4head` |
-| + GDN strided QKV, fused shared gate (**c4**) | **89.4** | **122.2** | **105.8** | `ab3_c4` |
+| arm | prose | JSON | code | ms/step | prefill | source |
+|---|---|---|---|---|---|---|
+| baseline (static hot set, ROCm 10 image) | 60.2 | 68.6 | 89.1 | 44.3 / 54.9 / 38.0 | 3066 | `ab3_r10_base_h15` |
+| + LRU expert cache | 76.7 | 112.6 | 94.1 | | | `ab3_lru1` |
+| + W4 draft LM head | 84.5 | 119.4 | 100.3 | | | `ab3_w4head` |
+| + GDN strided QKV, fused shared gate (c4) | 89.4 | 122.2 | 105.8 | 30.1 / 31.2 / 29.9 | 3191 | `ab3_c4` |
+| + fused SiLU-quant, QSA rope gather (c7) | 93.2 | 125.9 | 107.4 | 30.2 / 30.3 / 29.6 | 3220 | `ab3_c7` |
+| **c8 — c7 on the v2 victim kernel (what this repo builds)** | **91.8** | **124.1** | **106.2** | 30.0 / 30.8 / 29.4 | 3174 | `ab3_c8_v2` |
+
+The last two rows differ only in which build of the LRU kernel was loaded. `c7` ran the
+older `librlu_fused.so`; `c8` ran `librlu_v2.so`, whose rewritten victim selection is what
+`kernels/lru/r4d_lru.hip` now contains — so **c8 is the row this repository reproduces**.
+The 1.4 / 1.8 / 1.2 tok/s gap between them is inside the run-to-run spread (see caveats):
+the v2 kernel is a wash on single-stream throughput and exists to remove a latency cliff
+that only bites at B>=4 (below).
 
 Concurrency, aggregate tok/s across streams (`bench/concurrent_bench.py`):
 
-| streams | static hot set | LRU |
-|---|---|---|
-| B=1 |  76.6 |  94.0 |
-| B=2 |  88.6 | 114.9 |
-| B=4 | 126.6 | 151.8 |
+| streams | static hot set | LRU only | full stack (c8) |
+|---|---|---|---|
+| B=1 |  76.6 |  94.0 | 105.7 |
+| B=2 |  88.6 | 114.9 | — |
+| B=4 | 126.6 | 151.8 | 165.7 |
 
-Prefill is unchanged: 12,518 prompt tokens in 3.92 s = **3191 tok/s** (baseline 3066).
+### Why the v2 victim kernel matters at B=4
+
+The old victim search was a serial argmin per insert, and its cost had a cliff: at S=257
+slots it jumped from 18.6 us at 13 inserts to 43.4 us at 14, then climbed ~3 us/insert to
+224.9 us at 64. B=4 already runs 5-13 inserts/layer/step — immediately below the cliff —
+so a step that crossed it paid 52 layers x 25 us = **+1.3 ms/step**. The rewrite ranks all
+slots against one LDS key array instead, which is a fixed ~3.7 us regardless of insert
+count. Measured `us/call`, S=257 (`tests/lru/bench_victim.py`):
+
+| inserts | 0 | 1 | 2 | 4 | 8 | 13 | 14 | 32 | 64 |
+|---|---|---|---|---|---|---|---|---|---|
+| old (serial argmin) | 6.90 | 8.67 | 9.50 | 11.39 | 14.24 | 18.61 | **43.4** | 86.0 | 224.9 |
+| v2 (batched ranking) | 6.97 | 8.61 | 9.21 | 10.57 | 11.14 | 11.12 | **11.05** | 11.92 | 12.97 |
+
+Ranking is a regression below ~4 inserts, so short lists keep the serial argmin (`NSER 4`);
+both paths live in the same function and produce identical state. That equality is the
+whole point of `tests/lru/test_victim_equiv.py`, which compares `table` / `map_cold` /
+`slot_expert` / `slot_stamp` / `miss` / `n_miss` byte for byte between the two libraries
+over 19 cases (production B=1 and B=4, at and past the cliff, zero misses, capped by
+`max_inserts`, `max_inserts` 1 and 1024, empty slots, all-equal stamps, nothing-evictable
+on both paths, S=1024, read-through) plus a 3-perturbation negative control, 3/3 caught.
+
+The cliff itself was never root-caused. It sits at k=14 for S=257 and S=320, k=16 for
+S=200, is absent at S=129, and does not move with E.
+
+### MTP depth
+
+`num_speculative_tokens` is not a one-way dial. Same stack, MTP-3 vs MTP-4:
+
+| | prose | JSON | code |
+|---|---|---|---|
+| MTP-3 (`ab3_c2_mtp3`) | **94.0** | 115.7 | 93.1 |
+| MTP-4 (`ab3_c4`) | 89.4 | **122.2** | **105.8** |
+
+Prose prefers 3, JSON and code prefer 4, and MTP-6 (`ab3_c2_mtp6`) is worse than both on
+prose. The measured MTP-3 -> MTP-4 step costs +2.6 ms/step, and K1's offline replay
+(`tools/routecap/mtp_prefetch.py`) prices only ~0.29 ms of that as cold expert traffic
+(the 5th row adds 8.0 MB/step at 28 GB/s) — about 11%. The other ~2.3 ms is the 5th row's
+own GEMM and attention work. Each of the 4 speculative rows costs only ~0.3-0.5 ms/step of
+PCIe traffic because the LRU already flattens the routing-width penalty: misses per layer
+per step grow from 0.69 to 1.45 for 5x the rows, since the extra rows mostly re-route to
+experts the target row already pulled. **Deeper MTP is not priced by the expert cache** —
+tune it against your own traffic mix.
 
 Long context is intact: `bench/needle.py` is **9/9** at 32K / 128K / 200K x depth 10/50/90%,
 the longest prompt being 256,389 tokens.
@@ -49,8 +100,16 @@ the longest prompt being 256,389 tokens.
   table is the only multi-stream measurement.
 * **The W4 draft head trades acceptance for time.** It removes ~2.8 ms/step but lowers the
   speculative acceptance rate by roughly 5-9% relative (0.429 -> 0.421 prose, 0.744 -> 0.706
-  JSON, 0.551 -> 0.530 code). It is net positive here; it may not be on your traffic.
-* **`VLLM_GEMMA_NORM_FUSED` changes numerics** and is off by default. See `docs/PATCHES.md` #1.
+  JSON, 0.551 -> 0.530 code). It is net positive here; it may not be on your traffic. The
+  later arms partly recover it: `c7` measures 0.462 / 0.704 / 0.545 against `c4`'s
+  0.421 / 0.704 / 0.538 — identical on JSON, better on prose and code.
+* **`VLLM_GEMMA_NORM_FUSED` is a moving part and it now defaults to ON.** The patched
+  `layernorm.py` grew a mode 2 (fp32 weight, no-residual only) that keeps the `+1` in fp32
+  so the arithmetic matches the stock decomposition, and it made 2 the default. **No arm in
+  the table above was measured with it** — every one of them predates that change and ran
+  with the fused norm off. To reproduce the table exactly, export
+  `VLLM_GEMMA_NORM_FUSED=0`. Mode 1 is the original bf16-rounded variant and does perturb
+  numerics; see `docs/PATCHES.md` #1.
 * The ablation that rules out "the machinery, not the policy": `VLLM_R4D_LRU_MAX_INSERTS=0`
   (cache on, inserts disabled) measures 61.1 / 70.5 / 81.4 — indistinguishable from the
   cache-off control.
@@ -162,6 +221,10 @@ export VRAM_CARDS="card1 card2"             # /sys/class/drm cards for the drain
 ./launch/launch_q38fn.sh 15 262144          # 15 GB of expert slots/rank, 256K ctx
 ```
 
+The gates that measured a win are on by default: LRU + fused kernel, the W4 draft head,
+GDN strided QKV, the fused shared gate, the fused SiLU-quant, the QSA rope gather, and the
+UVA offload of `embed_tokens` and the vision tower. Every one is individually overridable.
+
 Server comes up on `:8057`. Startup lines worth grepping for:
 
 ```
@@ -191,16 +254,16 @@ gate defaulted **off**; it is what produced the baseline arms.
 | `VLLM_R4D_HOT_PROFILE` | — | routing-statistics JSON; chooses the per-layer slot budget and the warm start |
 | `VLLM_R4D_HOT_GB` | — | total expert-weight budget per rank, in GB |
 | `VLLM_R4D_SHARE_A8` | `1` | share the FP8 activation between the shared expert and the routed MoE. Unverified win; `0` in every measured arm. |
-| `VLLM_GEMMA_NORM_FUSED` | `0` | dispatch the fused `rms_norm` in eager regions. **-288 kernels/step, but it perturbs numerics** — read `docs/PATCHES.md` #1 first. |
+| `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions: -288 kernels/step. `2` keeps the `+1` in fp32 and skips the residual case, so only the final cast rounds; `1` is the original variant, which **perturbs numerics**; `0` is the stock path. Not in any measured arm — read `docs/PATCHES.md` #1 first. |
 | `VLLM_GDN_STRIDED_QKV` | `0` | strided QKV into the GDN linear attention: -144 copies/step, bit-identical |
 | `VLLM_FUSED_SHARED_GATE` | `0` | fuse the shared-expert gate multiply: -48/step, bit-identical |
-| `VLLM_FUSED_SILU_QUANT` | `0` | fuse SiLU-mul with the FP8 activation quant: -52/step, bit-identical. Measured neutral in `c6`. |
+| `VLLM_FUSED_SILU_QUANT` | `0` | fuse SiLU-mul with the FP8 activation quant: -52/step, bit-identical. Neutral on its own in `c6`; on in `c7`/`c8`. |
 | `VLLM_DRAFT_W4_LMHEAD` | `0` | W4 LM head for the MTP draft iterations: -2.8 ms/step, costs ~5-9% relative acceptance |
 | `VLLM_MOE_OUTPUT_ALIAS` | `1` | let the r4d MoE write straight into the caller's output buffer: -48 copies/step |
 | `VLLM_UVA_OFFLOAD_EMBED` | `0` | keep `embed_tokens` in host memory |
 | `VLLM_UVA_OFFLOAD_VISUAL` | `0` | keep the vision tower in host memory |
 | `VLLM_HC_R4D_BF16` | `0` | bf16 dispatch for the hot/cold r4d path (see `docs/HC_QUANT.md`) |
-| `VLLM_QSA_ROPE_GATHER` | `0` | fold the cos/sin gather into the mrope Triton kernel (hitlist #12). **Not in any measured arm** — it landed after the `c4`/`c6` runs. Degrades to a warning if the patched `mrope.py` is not mounted. |
+| `VLLM_QSA_ROPE_GATHER` | `0` | fold the cos/sin gather into the mrope Triton kernel (hitlist #12). On in `c7`/`c8`. Degrades to a warning if the patched `mrope.py` is not mounted. |
 
 ## Generating a hot profile
 

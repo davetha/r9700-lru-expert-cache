@@ -46,9 +46,20 @@ returns before VRAM is released — wait for `mem_info_vram_used` to drop before
 | `test_graph_lru.py` | yes | `librlu.so` | captures 4 layers x (manage + gather) into a HIP graph, replays 20x with changing routing. `NLAYER=4` keeps it quick. |
 | `test_trace_replay.py` | yes | `librlu.so`, a routing capture | the full 2330-step trace x 48 layers through the real kernel: static 23.3% / 432 MB/step -> LRU 4.6% / 86 MB/step |
 | `test_fused.py` | yes | `librlu.so` | `lru_fused_k` against the two-kernel path, including the read-through and zero-miss exits |
-| `test_victim_equiv.py` | yes | **two** libraries | compares the batched victim ranking against the older serial argmin. Needs `OLD_LIB` and `NEW_LIB`; only the current source ships here, so build an older revision first or skip it. |
+| `test_victim_equiv.py` | yes | **two** libraries | compares the v2 batched victim ranking against the older serial argmin, byte for byte over `table` / `map_cold` / `slot_expert` / `slot_stamp` / `miss` / `n_miss`, for both `r4d_lru_manage` and `r4d_lru_fused`, across 19 cases plus a 3-perturbation negative control. Build both sources first (see below) and pass `OLD_LIB` / `NEW_LIB`. |
 | `bench_split.py`, `bench_gather.py`, `bench_fused.py`, `bench_victim.py` | yes | `librlu.so` | cost. Manager 5.91 us/layer, empty gather 3.41, both 8.98; gather 25.2 GB/s at 1 expert, 28.4 at 52. |
 | `step0_nodecost.py` | yes | `librlu.so` | the cost of a step that inserts nothing |
+
+To build the older kernel that `test_victim_equiv.py` compares against:
+
+```bash
+docker run --rm -v "$PWD:/repo" --entrypoint bash local/q38fn-rocm10:build -c \
+  'mkdir -p /repo/build/kernels; SDK=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core; /opt/rocm/bin/hipcc -O3 \
+   -std=c++17 -fPIC --offload-arch=gfx1201 --rocm-device-lib-path=$SDK/lib/llvm/amdgcn/bitcode \
+   -shared /repo/kernels/lru/r4d_lru_pre_victim.hip -o /repo/build/kernels/librlu_old.so'
+# then, inside the test container:
+OLD_LIB=/w/build/kernels/librlu_old.so NEW_LIB=/w/build/kernels/librlu.so python3 test_victim_equiv.py
+```
 
 ### `tests/k1/` — the MoE ABI and the cold path
 

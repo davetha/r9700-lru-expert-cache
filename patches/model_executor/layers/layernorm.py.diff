@@ -9,7 +9,7 @@
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -15,6 +17,35 @@
+@@ -15,6 +17,37 @@
  
  logger = init_logger(__name__)
  
@@ -20,8 +20,10 @@
 +#   0 = stock decomposition.
 +#   1 = one fused kernel with (1 + w) rounded to x's dtype -- fastest, but the bf16
 +#       weight rounding changes generated text (max rel 7.8e-3).
-+#   2 = fp32-exact (default): cast x up, fuse in fp32, cast back -- 3 kernels, same
-+#       arithmetic as stock, so the text is unchanged.
++#   2 = fp32-exact (default): cast x up, fuse in fp32, cast back -- 3 kernels. The
++#       weight is never rounded, but the fused kernel's fp32 variance reduction is
++#       not torch's, so ~3e-6 of output elements land one bf16 ulp away from stock
++#       (measured, k4/probe_gemma1.py). That is 5 orders of magnitude below mode 1.
 +GEMMA_NORM_FUSED = int(os.environ.get("VLLM_GEMMA_NORM_FUSED") or 2)
 +_FUSED_NORM_IMPL: dict[str, object] = {}
 +
@@ -45,7 +47,7 @@
  
  def poly_norm(
      x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, variance_epsilon: float
-@@ -147,6 +178,65 @@
+@@ -147,6 +180,65 @@
          super().__init__()
          self.weight = nn.Parameter(torch.zeros(hidden_size))
          self.variance_epsilon = eps
@@ -111,7 +113,7 @@
  
      def forward_native(
          self,
-@@ -154,6 +244,11 @@
+@@ -154,6 +246,11 @@
          residual: torch.Tensor | None = None,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
          """PyTorch-native implementation equivalent to forward()."""
