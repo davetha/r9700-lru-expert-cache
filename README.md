@@ -400,6 +400,18 @@ the numbers are invalid. `launch/run_arm_bench.sh` fails loud on both conditions
 `launch/launch_q38fn_prof.sh` is the same launcher with the torch profiler wired up and every
 gate defaulted **off**; it is what produced the baseline arms.
 
+
+### Chat template
+
+Qwen3.8-Flash-Next thinks by default and its stock template has known issues (KV-cache
+invalidation, empty-think poisoning, agentic stalls). The launcher passes
+`--chat-template` with the community fixed template from
+[froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+(not vendored — run `templates/fetch.sh` once; `CHAT_TEMPLATE=` empty falls back to the
+checkpoint's template). Per request, `chat_template_kwargs` controls the thinking:
+`{"enable_thinking": false}` gives a direct answer (51 tokens for a one-sentence question in
+our test vs 148 with thinking on); `reasoning_effort` and `preserve_thinking` are also honoured.
+
 ### Environment knobs
 
 | variable | default | meaning |

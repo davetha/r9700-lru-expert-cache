@@ -47,6 +47,9 @@ VRAM_CARDS=${VRAM_CARDS:-"card2 card3"}
 LRU_LIB=${LRU_LIB:-/build/kernels/librlu.so}
 NAME=${NAME:-q38fn-mxfp4}
 HOT_GB=${1:-15.0}
+# chat template inside the container; templates/fetch.sh downloads the froggeric fixed template.
+# Set CHAT_TEMPLATE= (empty) to use the checkpoint's own template.
+CHAT_TEMPLATE=${CHAT_TEMPLATE-/templates/qwen_fixed_chat_template.jinja}
 MAXLEN=${2:-262144}
 
 [ -f "$MOUNTS_FILE" ] || { echo "no $MOUNTS_FILE - run patches/apply_patches.sh first" >&2; exit 1; }
@@ -81,7 +84,7 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
   -e VLLM_QSA_ROPE_GATHER="${VLLM_QSA_ROPE_GATHER:-1}" \
   -e VLLM_UVA_OFFLOAD_EMBED=1 -e VLLM_UVA_OFFLOAD_VISUAL=1 \
   -e VLLM_DRAFT_W4_LMHEAD="${VLLM_DRAFT_W4_LMHEAD:-1}" \
-  -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" \
+  -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" -v "$REPO_ROOT/templates:/templates:ro" \
   -p "$PORT:8000" $PM ${EXTRA_DOCKER_ARGS:-} \
   "$IMG" "$MODEL" \
     --served-model-name q38fn-mxfp4 \
@@ -96,5 +99,6 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
     --limit-mm-per-prompt.image 8 --limit-mm-per-prompt.video 1 --mm-processor-cache-gb .5 \
     --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_N:-4}${SPEC_EXTRA:-}}" \
     ${EXTRA_VLLM_ARGS:-} \
+    ${CHAT_TEMPLATE:+--chat-template $CHAT_TEMPLATE} \
     --host 0.0.0.0 --port 8000 >/dev/null
 echo "$NAME launching on :$PORT (hot ${HOT_GB} GB/rank, ctx ${MAXLEN})"
