@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # Build librlu.so (LRU expert-cache kernels) for gfx1201 with the ROCm 10 hipcc that ships
-# inside the server image.
-#
-# Run it in the *build* image (docker/Dockerfile.build = the runtime image + g++ + the
-# libamdhip64.so link symlink). The resulting .so loads fine in the runtime image, which
-# needs no compiler to dlopen it:
-#
-#   docker build -t q38fn-rocm10:build -f docker/Dockerfile.build docker/
-#   docker run --rm -v "$PWD:/repo" --entrypoint bash q38fn-rocm10:build \
-#     -c '/repo/kernels/lru/build.sh /repo/build/kernels/librlu.so'
-#
-# The runtime image's /opt/rocm is a symlink to the pip ROCm 10 SDK; SDK below must match.
+# inside the server image. Runs in local/q38fn-rocm10:k1build (= :try1 + g++ + the
+# libamdhip64.so link symlink); the resulting .so loads fine in :try1, which needs no
+# compiler to dlopen it.
 set -euo pipefail
-OUT=${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/librlu.so}
-SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/r4d_lru.hip
-SDK=${SDK:-/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core}
-GFX_ARCH=${GFX_ARCH:-gfx1201}
-mkdir -p "$(dirname "$OUT")"
-${HIPCC:-/opt/rocm/bin/hipcc} -O3 -std=c++17 -fPIC --offload-arch="$GFX_ARCH" \
+OUT=${1:-/w/k1/lru/librlu.so}
+SDK=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core
+/opt/rocm/bin/hipcc -O3 -std=c++17 -fPIC --offload-arch=gfx1201 \
   --rocm-device-lib-path="$SDK/lib/llvm/amdgcn/bitcode" \
-  -shared "$SRC" -o "$OUT"
+  -shared /w/k1/lru/r4d_lru.hip -o "$OUT"
+rc=$?
+if [ $rc -ne 0 ]; then echo "BUILD FAILED rc=$rc"; exit $rc; fi
 echo "built $OUT"
 ls -l "$OUT"
-nm -D "$OUT" | grep -E "r4d_lru_(manage|gather|fused)" || { echo "MISSING EXPORTS"; exit 1; }
+# All three entry points must be present. A build that silently loses one would show up
+# only once a server is already running -- as a dlopen failure, or worse, as the fused
+# path quietly never engaging.
+for sym in r4d_lru_manage r4d_lru_gather r4d_lru_fused; do
+  nm -D "$OUT" | grep -q " T $sym$" || { echo "MISSING EXPORT: $sym"; exit 1; }
+done
+echo "exports OK: r4d_lru_manage r4d_lru_gather r4d_lru_fused"
