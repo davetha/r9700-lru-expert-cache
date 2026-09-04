@@ -118,8 +118,8 @@ Run everything under the GPU lock, one card:
 
 ```
 flock -w 3600 <repo>/gpu.lock docker run --rm --ipc host --group-add video \
-  --device /dev/kfd --device /dev/dri -e HIP_VISIBLE_DEVICES=1 -v /home/dave/rocm10:/w \
-  -v /home/dave/hotcold:/hp --entrypoint bash local/q38fn-rocm10:k1build -c \
+  --device /dev/kfd --device /dev/dri -e HIP_VISIBLE_DEVICES=1 -v "$REPO_ROOT":/w \
+  -v "$PROFILE_DIR":/hp --entrypoint bash local/q38fn-rocm10:k1build -c \
   'cd /w/k1/lru && python3 test_lru.py && python3 test_numerics_lru.py &&
    NLAYER=4 python3 test_graph_lru.py && python3 test_trace_replay.py &&
    python3 test_fused.py && python3 test_victim_equiv.py'
