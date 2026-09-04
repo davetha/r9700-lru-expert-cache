@@ -103,13 +103,13 @@ the longest prompt being 256,389 tokens.
   JSON, 0.551 -> 0.530 code). It is net positive here; it may not be on your traffic. The
   later arms partly recover it: `c7` measures 0.462 / 0.704 / 0.545 against `c4`'s
   0.421 / 0.704 / 0.538 — identical on JSON, better on prose and code.
-* **`VLLM_GEMMA_NORM_FUSED` is a moving part and it now defaults to ON.** The patched
-  `layernorm.py` grew a mode 2 (fp32 weight, no-residual only) that keeps the `+1` in fp32
-  so the arithmetic matches the stock decomposition, and it made 2 the default. **No arm in
-  the table above was measured with it** — every one of them predates that change and ran
-  with the fused norm off. To reproduce the table exactly, export
-  `VLLM_GEMMA_NORM_FUSED=0`. Mode 1 is the original bf16-rounded variant and does perturb
-  numerics; see `docs/PATCHES.md` #1.
+* **`VLLM_GEMMA_NORM_FUSED` defaults to 2 and every arm from `combo1` onward (including `c4`,
+  `c7`, `c8`) ran with it on** — the `c4` and `c7` profiles show 32 `vllm::rms_norm_kernel`
+  launches per step, which only exist on the fused path. Mode 2 casts to fp32 around the
+  fused kernel so the arithmetic matches the stock decomposition to within the reduction
+  order (~3e-6 of elements differ by one bf16 ulp; none at decode row counts). Mode 1 (bf16
+  weight) perturbs ~30% of elements and is not used by default; `0` is the stock 10-kernel
+  path. See `docs/PATCHES.md` #1.
 * The ablation that rules out "the machinery, not the policy": `VLLM_R4D_LRU_MAX_INSERTS=0`
   (cache on, inserts disabled) measures 61.1 / 70.5 / 81.4 — indistinguishable from the
   cache-off control.
