@@ -35,6 +35,7 @@ Data artifacts the documents cite — `routes_rank*.npz`, `aligned.pkl`, `tensor
 | `REVIEW.md` | a read-only review of the LRU work: correctness findings, what is left on the table |
 | `HC_QUANT.md` | quantization choices for the hot/cold split (K3) |
 | `RESULTS.md` | K3's skinny-GEMM and cold-path benchmark results |
+| (see `kernels/experimental/fp8skinny/README.md`) | the open fp8 skinny GEMM: why it is a non-win, and the benchmarking method that established it |
 | `VRAM_CENSUS.md` | where the 32 GB per card actually goes |
 | `FP8HIP_KNOBS.md` | the closed `libfp8hip_gemm.so` tuning knobs found by probing |
 | `GDN_GATE.md` | the gated delta-net attention path and its dispatch conditions |

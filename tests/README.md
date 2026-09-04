@@ -82,6 +82,14 @@ correctness; `bench_skinny.py`, `bench_cold.py`, `bench_prod.py`, `bench_r4d.py`
 `bench_fp8.py`, `bench_int4.py`, `w4_bench.py` are timing. All GPU, all single-card.
 `shapes.py` / `shapes2.py` / `block.py` are shape helpers the others import.
 
+The `*_fp8sk` / `*_roof` / `test_layout` / `smoke_patch` harnesses belong to the experimental
+fp8 skinny GEMM (`kernels/experimental/fp8skinny/`). They read two libraries by env var:
+`FP8SK_LIB` (default `/w/build/kernels/libhcqfp8sk.so`, built by that directory's `build.sh`)
+and `FP8HIP_LIB` (default `/app/fp8hip/libfp8hip_gemm.so`, the closed kernel inside the fork
+image — not shipped, and only reachable from within a container built on that image).
+`test_layout.py` is the exception: it proves the weight-shuffle layout on CPU and needs
+neither a GPU nor either library.
+
 ### `tests/k4/` — the kernel-count patches
 
 `smoke_imports.py` is the one to run first: it imports every patched module with the gates on

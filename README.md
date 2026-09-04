@@ -286,7 +286,7 @@ gate defaulted **off**; it is what produced the baseline arms.
 | `VLLM_R4D_HOT_PROFILE` | — | routing-statistics JSON; chooses the per-layer slot budget and the warm start |
 | `VLLM_R4D_HOT_GB` | — | total expert-weight budget per rank, in GB |
 | `VLLM_R4D_SHARE_A8` | `1` | share the FP8 activation between the shared expert and the routed MoE. Unverified win; `0` in every measured arm. |
-| `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions: -288 kernels/step. `2` keeps the `+1` in fp32 and skips the residual case, so only the final cast rounds; `1` is the original variant, which **perturbs numerics**; `0` is the stock path. Not in any measured arm — read `docs/PATCHES.md` #1 first. |
+| `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions. `2` casts to fp32 around the fused kernel, matching the stock decomposition up to reduction order, for **-224 kernels/step**; it is the file default and was on in every arm from `combo1` onward. `1` is the original bf16-weight variant, -288/step but it **perturbs ~30% of elements**; `0` is the stock 10-kernel path. See `docs/PATCHES.md` #1. |
 | `VLLM_GDN_STRIDED_QKV` | `0` | strided QKV into the GDN linear attention: -144 copies/step, bit-identical |
 | `VLLM_FUSED_SHARED_GATE` | `0` | fuse the shared-expert gate multiply: -48/step, bit-identical |
 | `VLLM_FUSED_SILU_QUANT` | `0` | fuse SiLU-mul with the FP8 activation quant: -52/step, bit-identical. Neutral on its own in `c6`; on in `c7`/`c8`. |
@@ -347,6 +347,48 @@ flock -w 3600 gpu.lock docker run --rm --ipc host --group-add video \
   'cd /w/tests/lru && python3 test_lru.py && python3 test_numerics_lru.py &&
    NLAYER=4 python3 test_graph_lru.py && python3 test_trace_replay.py'
 ```
+
+## Negative results
+
+Things that were built, measured, and did not earn a place in the default configuration.
+They are here because the measurement is worth more than the outcome, and because the next
+person should not spend a day rediscovering them.
+
+* **An open fp8 skinny GEMM is not the lever.** `hcq_gemm_fp8blk_nt_m16` reimplements the
+  closed `fp8hip_gemm_w8a8_tiled` for M<=16 — same operands byte for byte, including the
+  pre-shuffled weight, so it needs no second copy in VRAM. It is correct and graph-safe, and
+  it is **1.01x** on the production shape mix in isolation. In the running server (arm `t9`)
+  it is a dead heat: 2.81 ms/step across 96 calls against fp8hip's 2.81 ms/step across 96.
+  The reason is that these layers are already memory-bound — fp8hip runs within 4-9% of a
+  pure-read control kernel, i.e. at 91-96% of what the access pattern can do at all. Shipped
+  behind `VLLM_HC_FP8SK` (default `0`) in `kernels/experimental/fp8skinny/`, whose README is
+  mostly about the benchmarking method: a nominal-spec roofline said "47% of peak" and was
+  measuring nothing.
+* **The one-kernel Gemma norm was rejected on one element.** Mode 3 folded mode 2's
+  cast / fused / cast into a single Triton kernel, -64 launches/step. The gate for shipping
+  was bit-identity with mode 2; it missed by **1 element in 81.8M**. `docs/PATCHES.md` P-A.
+* **The mode-2 shared-gate fold was superseded.** `VLLM_FUSED_SHARED_GATE=2` would have saved
+  another 52 launches/step, but K3's dispatch change routes the same GEMV to r4d for a larger
+  win, and the fold showed no divergence in 8.2M elements without being provable. Keep it
+  off. `docs/PATCHES.md` #7m2.
+* **`VLLM_SKINNY_CU_COUNT` is not a lever.** 19-point CuCount curves, including
+  non-powers-of-two, put the projected saving at **0 us/step**; setting it far above the real
+  WGP count makes things worse, not better. `docs/RESULTS.md`.
+* **The `FP8HIP_*` env knobs do nothing reachable.** Disassembly of the closed
+  `libfp8hip_gemm.so` shows all three are consumed inside a code path the vLLM wrapper never
+  enters. `docs/FP8HIP_KNOBS.md`.
+* **Side-stream hot/cold overlap halved throughput.** Overlapping the cold gather on a second
+  stream inside the HIP graph was much worse than serialising it — cross-stream waits are
+  expensive here. `VLLM_R4D_HOT_SIDE_STREAM` is measured-dead; arm `side1` measured
+  32.7 / 39.7 / 90.7.
+* **No prefetch predictor beats LRU residency.** Scored against the LRU's own miss stream —
+  64,095 real misses — a last-step predictor covers 0.0% at every budget, frequency 0.4-6.4%,
+  co-occurrence 2.0-16.2% at 22-45x wasted bytes. 66.7% of missed experts never appear again
+  in the generation, so the misses are compulsory and there is nothing to predict.
+  `docs/K1_PROGRESS.md` Task I(c).
+* **Nothing beat a plain UVA gather for the cold transfer.** Staged pinned copies, wider
+  slabs and the alternatives in `docs/COLD_TRANSFER.md` all land at or below the 28.4 GB/s the
+  simple path already gets — which is itself a PCIe Gen4 root-port limit, not a software one.
 
 ## What is not here
 

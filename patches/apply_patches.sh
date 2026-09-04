@@ -13,6 +13,9 @@
 #   IMAGE      fork image to take originals from (default tcclaviger/vllm:DevQwenNextFlash)
 #   MOE_MODE   lru (default) or static -- which r4d_mxfp4_moe.py variant to apply
 #   BUILD      output dir (default <repo>/build)
+#   WITH_FP8SK 1 also applies the experimental fp8 skinny-GEMM dispatcher. Off by default:
+#              the kernel is a measured non-win (see kernels/experimental/fp8skinny/README.md)
+#              and none of the results in the top-level README were produced with it mounted.
 set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
@@ -42,6 +45,13 @@ third_party/flash_linear_attention/ops/fused_sigmoid_gating.py|third_party/flash
 model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py|model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py.diff
 model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py|model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py.MOE_MODE.diff
 "
+
+# Opt-in, off by default. VLLM_HC_FP8SK gates it to the closed kernel at runtime anyway.
+if [ "${WITH_FP8SK:-0}" = "1" ]; then
+  PATCHED="$PATCHED
+model_executor/kernels/linear/scaled_mm/fp8hip.py|model_executor/kernels/linear/scaled_mm/fp8hip.py.diff
+"
+fi
 
 # Files that are entirely ours: repo path <- vllm-relative destination.
 NEWFILES="

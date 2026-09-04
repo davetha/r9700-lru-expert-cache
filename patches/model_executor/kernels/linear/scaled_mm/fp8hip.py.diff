@@ -1,0 +1,119 @@
+--- a/vllm/model_executor/kernels/linear/scaled_mm/fp8hip.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/fp8hip.py
+@@ -26,14 +26,87 @@
+ import torch
+ 
+ from vllm.model_executor.utils import replace_parameter
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
+ from .ScaledMMLinearKernel import FP8ScaledMMLinearLayerConfig
+ 
++logger = init_logger(__name__)
++
+ _LIB_PATH = os.environ.get("FP8HIP_LIB", "/app/fp8hip/libfp8hip_gemm.so")
+ 
++# --- K3: small-M skinny path -------------------------------------------------
++# hcq_gemm_fp8blk_nt_m16 (k3/hcq_fp8skinny.hip) serves the same operands as the closed
++# fp8hip kernel -- including the SAME pre-shuffled weight tensor, since
++# shuffle_weight_gfx1201's byte order is already gfx1201 WMMA fragment order -- but
++# decomposes the output into 16-wide N tiles times a k-split instead of 128-wide tiles.
++# The closed kernel launches exactly N/128 workgroups, which at the 2560-wide
++# out_proj/o_proj shape is 20 on a 64-CU part; measured on prof_eager_h15 that shape runs
++# at 302 GB/s against a 644.6 GB/s roofline, and it is 48 of the 96 fp8 GEMMs per decode
++# step. See k3/bench_fp8sk.json for the measured table this dispatch is tuned from.
++#
++# NOT bit-identical to fp8hip: the block scales are applied once per 128-K chunk rather
++# than folded per element, which is an exact regrouping of the same products but a
++# different fp32 association. VLLM_HC_FP8SK=0 restores the closed kernel exactly.
++_HCQ_ON = os.environ.get("VLLM_HC_FP8SK", "0") == "1"
++_HCQ_MAX_M = int(os.environ.get("VLLM_HC_FP8SK_MAX_M", "16"))
++_HCQ_LIB_PATH = os.environ.get("FP8SK_LIB", "/build/kernels/libhcqfp8sk.so")
++_HCQ_DEBUG = os.environ.get("VLLM_HC_FP8SK_DEBUG", "0") == "1"
++
++# (N, K) -> (WV, SK, NPW), measured. Shapes not in the table fall through to fp8hip
++# rather than guessing: an untuned config is not obviously a win, and the closed kernel
++# is already at 72-77% of roofline on the wide shapes.
++_HCQ_CFG_TABLE: dict[tuple[int, int], tuple[int, int, int]] = {
++    (8192, 2560): (8, 2, 1),   # gdn in_proj_qkvz   x36/step
++    (6656, 2560): (2, 4, 1),   # qsa qkv_proj       x12/step
++    (2560, 3072): (2, 8, 1),   # gdn out_proj + qsa o_proj  x48/step
++}
++# Measured 2026-09-04 at M=5 over a 1 GB weight pool, in-graph (k3/bench_fp8sk.json).
++# The honest reading of that bench is that this dispatch is NOT worth switching on for
++# throughput: isolated, fp8hip already runs these shapes at 500-575 GB/s against a
++# 535-593 GB/s streaming-read control (k3/bench_roof.json, hcq_stream_probe over the same
++# pool), and this kernel is 1.00x / 1.00x / 1.04x on the three shapes -- about -0.024
++# ms/step at M=5. It defaults OFF. What it is still good for is an in-situ A/B: the
++# production trace shows these calls at 26-42 us where isolation says 16-37, i.e. ~17%
++# of the fp8 GEMM time is contention with the rest of the decode step, and this kernel's
++# access pattern (N/16 tiles x split-K, 80-512 workgroups) is not the closed kernel's
++# (N/128 fat workgroups, 20 of them at N=2560), so it may or may not degrade the same way.
++_HCQ_TABLE_NOTE = "M=5, k3/bench_fp8sk.json + k3/bench_roof.json, 2026-09-04"
++
++
++@functools.lru_cache
++def _hcq_lib():
++    if not _HCQ_ON or not os.path.exists(_HCQ_LIB_PATH):
++        return None
++    lib = ctypes.CDLL(_HCQ_LIB_PATH)
++    lib.hcq_gemm_fp8blk_nt_m16.restype = ctypes.c_int
++    lib.hcq_gemm_fp8blk_nt_m16.argtypes = \
++        [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
++    return lib
++
++
++def _hcq_cfg(M, N, K, qx, xs, ws):
++    """The config to run this call with, or None to leave it to fp8hip.
++
++    Every condition the kernel assumes is checked HERE rather than inside it: it returns
++    an error code for a violated precondition and the caller raises, so a shape that
++    reaches it must already be one it can serve."""
++    if not (1 <= M <= _HCQ_MAX_M):
++        return None
++    if N % 128 or K % 128:
++        return None
++    if qx.dtype != torch.float8_e4m3fn or not qx.is_contiguous():
++        return None
++    if xs.dtype != torch.float32 or xs.shape != (M, K // 128) or not xs.is_contiguous():
++        return None
++    if ws.dtype != torch.float32 or ws.shape != (N // 128, K // 128) or not ws.is_contiguous():
++        return None
++    return _HCQ_CFG_TABLE.get((N, K))
++
++
++
+ 
+ @functools.lru_cache
+ def _lib():
+@@ -69,6 +142,28 @@
+     xs = x_scale.contiguous()
+     ws = w_scale.contiguous()
+     stream = torch.cuda.current_stream().cuda_stream
++    lib = _hcq_lib()
++    if lib is not None:
++        cfg = _hcq_cfg(M, N, K, qx, xs, ws)
++        if cfg is not None:
++            if _HCQ_DEBUG:
++                logger.info("fp8sk M=%d N=%d K=%d -> hcq WV=%d SK=%d NPW=%d",
++                            M, N, K, *cfg)
++            rc = lib.hcq_gemm_fp8blk_nt_m16(
++                ctypes.c_void_p(qx.data_ptr()),
++                ctypes.c_void_p(xs.data_ptr()),
++                ctypes.c_void_p(weight_shuf.data_ptr()),
++                ctypes.c_void_p(ws.data_ptr()),
++                ctypes.c_void_p(y.data_ptr()),
++                M, K, N, cfg[0], cfg[1], cfg[2], ctypes.c_void_p(stream))
++            # The guard above already established every precondition, so a non-zero code
++            # here is a bug in this file, not an unsupported shape. Do not fall back.
++            if rc != 0:
++                raise RuntimeError(
++                    f"hcq_gemm_fp8blk_nt_m16 rc={rc} M={M} N={N} K={K} cfg={cfg}")
++            return y
++        if _HCQ_DEBUG:
++            logger.info("fp8sk M=%d N=%d K=%d -> fp8hip (no config)", M, N, K)
+     rc = _lib().fp8hip_gemm_w8a8_launch(
+         ctypes.c_void_p(qx.data_ptr()),
+         ctypes.c_void_p(weight_shuf.data_ptr()),
