@@ -163,6 +163,15 @@ memory-profiling forward is booked as activation peak and taken out of the KV bu
 sizing once); and the fragment shuffle is done per chunk for the same reason. KV headroom still
 drops by the fp8 copy (~0.33 GiB). The PLE tables (47.75 GiB of fp8) cannot leave the CPU worker.
 
+### What did not work on the cache
+
+Replacement policy is bounded by Belady at ~0.7 ms/step (LRU 4.6% miss vs 2.6% optimal; two thirds of
+misses never recur). Same-layer prefetch covers 0-16% of misses at 20-45x wasted bytes. Cross-layer
+prefetch (predict layer L+1 from layer L's routing, `bench/xlayer_pred.py`) covers 4% of misses within
+one layer's PCIe window and 19% with a whole layer's worth of slabs at 2.9x waste. Staging cold
+experts before compute loses 3-9%. Details in `docs/LOCALITY.md`. The remaining 1.6 ms/step of gather
+is compulsory traffic on a Gen4 link.
+
 ### Caveats
 
 * **Restart-to-restart nondeterminism.** Greedy output on this box is stable within a server

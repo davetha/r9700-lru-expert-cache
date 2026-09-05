@@ -292,3 +292,21 @@ Static reproduces the profile's predicted 14.9% to three digits -- the simulator
 correct by construction -- and **every implementable dynamic policy is decisively worse than
 static** once the locality is removed. The win in section 2 is temporal locality in real
 traffic, not an artifact of the simulator or of the byte accounting.
+
+## Cross-layer prediction (2026-09-04, `xlayer_pred.py`)
+
+Can layer L+1's experts be predicted from layer L's routing early enough to prefetch them during
+layer L's compute? Predictors trained on the first 70% of 2330 five-row steps, scored on the rest,
+against an LRU simulation with S=257 slots/layer (77 misses/step = 1.6/layer, matching production).
+
+| predictor | K | recall of S_{L+1} | LRU-miss coverage | over-fetch (extra/misses) |
+|---|---|---|---|---|
+| popularity floor | 8 / 16 / 32 | 0.05 / 0.09 / 0.17 | 0.015 / 0.03 / 0.06 | 1.3 / 2.5 / 5.1 |
+| set co-occurrence | 8 / 16 / 32 | 0.13 / 0.22 / 0.37 | 0.03 / 0.06 / 0.13 | 0.6 / 1.3 / 2.7 |
+| per-token transition | 8 / 16 / 32 | 0.15 / 0.26 / 0.42 | 0.04 / 0.09 / 0.19 | 0.6 / 1.3 / 2.9 |
+
+The PCIe window during one layer's compute (~0.4 ms at 28 GB/s) fits ~8 experts, where the best
+predictor covers 4% of misses. Even at K=32 (a whole layer's worth of slabs) it covers 19% at 2.9x
+wasted bytes. The next layer's expert choice is not encoded in the previous layer's routing.
+Not tested: a learned predictor on the hidden state itself (pre-gating style); it would need
+hidden-state capture and training, and the misses it must find are the rare experts.
