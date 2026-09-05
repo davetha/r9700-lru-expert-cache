@@ -155,7 +155,7 @@ pairs where possible:
 |---|---|---|---|
 | fp8 128x128 block-scaled **target** lm_head (`kernels/fp8_target_lmhead.py`, fp8hip GEMM) | -1.02 (prose -1.58, JSON -0.74, code -0.75) | teacher-forced 0.047/0.013/0.017 vs base-vs-base 0.043/0.018/0.019 | **on** (`VLLM_TARGET_FP8_LMHEAD=1`) |
 | text-only mode (`MM_IMAGE=0 MM_VIDEO=0`): vLLM then embeds inside the graph | -0.49 | at the restart floor | off (disables image input) |
-| skip the provably-empty cold MoE GEMM call at decode (`VLLM_R4D_LRU_SKIP_EMPTY_COLD=1`) | -0.26 (two pairs) | none by construction | off |
+| skip the provably-empty cold MoE GEMM call at decode (`VLLM_R4D_LRU_SKIP_EMPTY_COLD=1`) | -0.25 (three pairs; on the fp8 stack: 27.78/28.23/28.56 vs 27.58/28.57/29.18) | none by construction | **on** |
 
 The fp8 head halves the 636 MB/rank bf16 head read (1 ms at the bandwidth roofline). Two traps:
 the weight must be quantized in row chunks, because a whole-weight `.float()` inside vLLM's
@@ -247,6 +247,9 @@ server restarts (see caveats), so differences of a few percent between arms are 
 | `base4` | cfg | 91.2 | 134.5 | 120.5 | 28.93/29.15/30.17 | 0.412/0.732/0.661 | 3541 |
 | `fp8head2` | cfg + skip-cold + fp8 target lm_head | 93.1 | 138.8 | 128.5 | 27.50/28.12/28.83 | 0.395/0.727/0.674 | 3551 |
 | `base5` | cfg + skip-cold | 94.6 | 138.6 | 128.4 | 29.08/28.86/29.58 | 0.444/0.752/0.698 | 3526 |
+| `fp8_base_a` | fp8head (launcher default before skip-cold) | 90.4 | 133.9 | 121.4 | 27.24/28.59/29.25 | 0.363/0.711/0.639 | 3547 |
+| `fp8_skip` | fp8head + skip empty cold call = launcher default | 91.2 | 140.3 | 126.5 | 27.78/28.23/28.56 | 0.381/0.739/0.654 | 3560 |
+| `fp8_base_b` | fp8head | 92.6 | 131.6 | 121.3 | 27.92/28.54/29.10 | 0.399/0.689/0.635 | 3547 |
 
 
 ### Per-step kernel breakdown, baseline vs final
@@ -485,7 +488,7 @@ our test vs 148 with thinking on); `reasoning_effort` and `preserve_thinking` ar
 | `VLLM_R4D_MOE_CFG1` | unset (launcher: `1,2,4`) | `wv,sk,npw` launch config of the gate_up grouped MoE GEMM; unset = the dense picker's `(4,8,2)`. Swept in `docs/HOTPATH.md`. |
 | `VLLM_R4D_MOE_CFG2` | unset (launcher: `1,1,1`) | same for the down GEMM; unset = `(8,2,2)`. |
 | `VLLM_TARGET_FP8_LMHEAD` | `0` (launcher: `1`) | quantize the TARGET lm_head to fp8 with 128x128 block scales at first use and run it through the fp8hip GEMM at M<=64. -1.0 ms/step; changes logits within restart noise. |
-| `VLLM_R4D_LRU_SKIP_EMPTY_COLD` | `0` | `1` skips the cold-fallback MoE GEMM call when every miss is provably inserted (mtk <= min(MAX_INSERTS, THRESH*S)). -0.26 ms/step, no numerics change. |
+| `VLLM_R4D_LRU_SKIP_EMPTY_COLD` | `0` (launcher: `1`) | `1` skips the cold-fallback MoE GEMM call when every miss is provably inserted (mtk <= min(MAX_INSERTS, THRESH*S)). -0.25 ms/step over three pairs, no numerics change. |
 | `MM_IMAGE` / `MM_VIDEO` (launcher) | `8` / `1` | `--limit-mm-per-prompt` values; both `0` = text-only mode, which moves the token embedding into the graph (-0.49 ms/step) and disables image input. |
 | `VLLM_R4D_SHARE_A8` | `1` | share the FP8 activation between the shared expert and the routed MoE. Unverified win; `0` in every measured arm. |
 | `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions. `2` casts to fp32 around the fused kernel, matching the stock decomposition up to reduction order, for **-224 kernels/step**; it is the file default and was on in every arm from `combo1` onward. `1` is the original bf16-weight variant, -288/step but it **perturbs ~30% of elements**; `0` is the stock 10-kernel path. See `docs/PATCHES.md` #1. |
