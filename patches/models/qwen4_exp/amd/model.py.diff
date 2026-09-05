@@ -21,7 +21,7 @@
  from .qsa import Qwen4ExpQSAAttention
  
 +# k2 patch (2026-09-04): opt-in UVA host offload for embed_tokens / visual.
-+# See patches/MOUNTS.txt.template for the bind mount, and the README for the env vars.
++# See /home/dave/rocm10/patches/MOUNTS_K2.txt for the bind mount and env vars.
 +from vllm.model_executor.offloader.base import should_pin_memory
 +from vllm.utils.mem_utils import format_gib
 +from vllm.utils.platform_utils import is_uva_available
@@ -95,7 +95,60 @@
  
          def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
              layer_idx = extract_layer_index(prefix)
-@@ -877,6 +944,8 @@
+@@ -786,7 +853,52 @@
+             ),
+         )
+ 
++    _fp8_head_state: object | None = None   # None = undecided, False = refused, object = installed
++
++    def _fp8_target_head_once(self, hidden_states: torch.Tensor) -> None:
++        """Decide the fp8 target head ONCE, identically on every TP rank (same vote pattern as
++        the draft W4 head: every guard votes, one all-reduce makes it unanimous, no early
++        return ahead of the all-reduce)."""
++        from vllm.distributed import tensor_model_parallel_all_reduce
++        packed = None
++        reason = None
++        lp = self.logits_processor
++        if lp.logits_as_input or lp.scale != 1.0 or lp.soft_cap is not None or (
++                lp.head_dtype is not None and lp.head_dtype != hidden_states.dtype):
++            reason = f"logits processor is not a plain projection (scale={lp.scale} soft_cap={lp.soft_cap})"
++        else:
++            try:
++                from vllm.model_executor.kernels import fp8_target_lmhead as fh
++            except ImportError:
++                reason = "vllm.model_executor.kernels.fp8_target_lmhead is not mounted"
++            else:
++                w = self.lm_head.weight
++                if not fh.available():
++                    reason = "fp8hip is not available on this platform"
++                elif w.dim() != 2 or w.shape[0] % 128 or w.shape[1] % 128 or w.dtype != torch.bfloat16:
++                    reason = f"lm_head shard {tuple(w.shape)} {w.dtype} is not 128x128-blockable bf16"
++                else:
++                    packed = fh.Fp8TargetHead(self.lm_head.quant_method, w)
++        tp_size = self.lm_head.tp_size
++        if tp_size > 1:
++            vote = torch.tensor([1 if packed is not None else 0], dtype=torch.int32,
++                                device=hidden_states.device)
++            if int(tensor_model_parallel_all_reduce(vote).item()) != tp_size:
++                packed = None
++                reason = reason or "another TP rank refused the fp8 head"
++        if packed is None:
++            type(self)._fp8_head_state = False
++            logger.warning("VLLM_TARGET_FP8_LMHEAD=1 but %s; the target lm_head stays bf16.", reason)
++        else:
++            self.lm_head.quant_method = packed
++            type(self)._fp8_head_state = packed
++            logger.info("target lm_head -> fp8 128x128 block-scaled (%s), fp8hip GEMM at M<=%d",
++                        tuple(self.lm_head.weight.shape), fh._MAX_M)
++
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        if (type(self)._fp8_head_state is None and os.environ.get("VLLM_TARGET_FP8_LMHEAD", "0") == "1"
++                and not torch.cuda.is_current_stream_capturing()):
++            self._fp8_target_head_once(hidden_states)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+@@ -877,6 +989,8 @@
                      quant_config=quant_config,
                      prefix=maybe_prefix(prefix, "visual"),
                  )

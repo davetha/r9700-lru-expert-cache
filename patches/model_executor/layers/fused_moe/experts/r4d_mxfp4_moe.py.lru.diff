@@ -25,7 +25,7 @@
  from vllm.model_executor.layers.fused_moe.activation import MoEActivation
  from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
      OCP_MXQuantizationEmulationTritonExperts,
-@@ -43,6 +56,329 @@
+@@ -43,6 +56,330 @@
  
  BLOCK = 16
  
@@ -144,6 +144,7 @@
 +_LRU_ON = os.environ.get("VLLM_R4D_LRU", "0") == "1"
 +_LRU_THRESH = float(os.environ.get("VLLM_R4D_LRU_THRESH", "0.5"))
 +_LRU_MAX_INSERTS = int(os.environ.get("VLLM_R4D_LRU_MAX_INSERTS", "64"))
++_LRU_SKIP_EMPTY_COLD = os.environ.get("VLLM_R4D_LRU_SKIP_EMPTY_COLD", "0") == "1"   # measured -0.26 ms/step; off by default (2026-09-04 decision)
 +_LRU_CHUNKS = int(os.environ.get("VLLM_R4D_LRU_CHUNKS", "8"))
 +_LRU_LANES = int(os.environ.get("VLLM_R4D_LRU_LANES", "16"))
 +_LRU_FUSE = os.environ.get("VLLM_R4D_LRU_FUSE", "0") == "1"
@@ -355,7 +356,7 @@
  
  def _permute_moe_inplace(w: torch.Tensor) -> None:
      """[E, N, K/2] uint8 checkpoint order -> r4d fragment order, expert by expert so the
-@@ -117,12 +453,76 @@
+@@ -117,12 +454,76 @@
  )
  
  
@@ -432,7 +433,7 @@
  
      def _decline(self, why: str) -> bool:
          self._r4d_state = "declined"
-@@ -166,14 +566,172 @@
+@@ -166,14 +567,173 @@
          self.w1_wref = s1.max(dim=2).values.contiguous()        # [E, N1]
          self.w2_ws_t = s2.transpose(1, 2).contiguous()          # [E, I/32, Hw]
          self.w2_wref = s2.max(dim=2).values.contiguous()        # [E, Hw]
@@ -581,12 +582,13 @@
 +    _SIDE = os.environ.get("VLLM_R4D_HOT_SIDE_STREAM", "0") == "1"
 +
 +    def _gemm_split(self, y, qx, xs, w_full, ws_t, wref, w_hot, ws_t_hot, wref_hot,
-+                    align_hot, align_cold, tw, mtk, top_k, cfg):
++                    align_hot, align_cold, tw, mtk, top_k, cfg, skip_cold=False):
 +        if not self._SIDE:
 +            torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
 +                y, qx, xs, w_hot, ws_t_hot, wref_hot, *align_hot, tw, mtk, top_k, *cfg)
-+            torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
-+                y, qx, xs, w_full, ws_t, wref, *align_cold, tw, mtk, top_k, *cfg)
++            if not skip_cold:
++                torch.ops.vllm.r4d_mxfp4_moe_gemm_into(
++                    y, qx, xs, w_full, ws_t, wref, *align_cold, tw, mtk, top_k, *cfg)
 +            return
 +        # The cold call is PCIe-bound (~28 GB/s pull over UVA) and the hot call is VRAM
 +        # compute; the two write disjoint rows of y, so run the hot call on a side stream
@@ -607,7 +609,7 @@
      def apply(
          self,
          output: torch.Tensor,
-@@ -205,21 +763,72 @@
+@@ -205,21 +765,79 @@
          top_k = topk_ids.size(1)
          mtk = M * top_k
          N1 = w1.shape[1]
@@ -672,16 +674,23 @@
 +                                             ignore_invalid_experts=True)
 +            align_cold = moe_align_block_size(topk_ids, BLOCK, E, h["map_cold"],
 +                                              ignore_invalid_experts=True)
++        # With mtk routing slots there are at most mtk distinct experts. When that is within
++        # both the insert cap and the read-through threshold, the manager inserts EVERY
++        # miss (S >= 182 slots always leaves enough unrouted victims), so map_cold names no
++        # routed expert and the cold GEMM would run empty: skip its 2 launches/layer. The
++        # graph is captured per batch size, so this is a per-graph constant, not a sync.
++        skip_cold = (_LRU_SKIP_EMPTY_COLD and "lru" in h
++                     and mtk <= min(h["lru"]["max_inserts"], h["lru"]["max_distinct"]))
 +        qx, xs = fp8_quant_shared(hidden_states)
 +        ic1 = torch.empty(mtk, N1, dtype=torch.bfloat16, device=hidden_states.device)
 +        self._gemm_split(ic1, qx, xs, w1, self.w1_ws_t, self.w1_wref,
 +                         h["w1"], h["w1_ws_t"], h["w1_wref"],
-+                         align_hot, align_cold, None, mtk, top_k, self.cfg1)
++                         align_hot, align_cold, None, mtk, top_k, self.cfg1, skip_cold)
 +        q2, s2 = self._act_quant(activation, ic1, mtk, N1, hidden_states)
 +        tw = None if apply_router_weight_on_input else \
 +            topk_weights.to(torch.float32).reshape(-1).contiguous()
 +        ic3 = torch.empty(mtk, H, dtype=torch.bfloat16, device=hidden_states.device)
 +        self._gemm_split(ic3, q2, s2, w2, self.w2_ws_t, self.w2_wref,
 +                         h["w2"], h["w2_ws_t"], h["w2_wref"],
-+                         align_hot, align_cold, tw, mtk, 1, self.cfg2)
++                         align_hot, align_cold, tw, mtk, 1, self.cfg2, skip_cold)
 +        ops.moe_sum(ic3.view(M, top_k, H), output)

@@ -17,5 +17,6 @@
 -v $BUILD/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py:/app/vllm/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py:ro
 -v $BUILD/vllm/model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py:/app/vllm/vllm/model_executor/layers/fused_moe/experts/r4d_mxfp4_moe.py:ro
 -v $BUILD/vllm/model_executor/kernels/draft_w4_lmhead.py:/app/vllm/vllm/model_executor/kernels/draft_w4_lmhead.py:ro
+-v $BUILD/vllm/model_executor/kernels/fp8_target_lmhead.py:/app/vllm/vllm/model_executor/kernels/fp8_target_lmhead.py:ro
 -v $BUILD/vllm/model_executor/layers/fused_silu_mul_quant.py:/app/vllm/vllm/model_executor/layers/fused_silu_mul_quant.py:ro
 -v $BUILD/vllm/model_executor/layers/fused_gate_mul.py:/app/vllm/vllm/model_executor/layers/fused_gate_mul.py:ro

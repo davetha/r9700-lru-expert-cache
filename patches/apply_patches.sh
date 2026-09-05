@@ -56,6 +56,7 @@ fi
 # Files that are entirely ours: repo path <- vllm-relative destination.
 NEWFILES="
 kernels/draft_w4_lmhead.py|model_executor/kernels/draft_w4_lmhead.py
+kernels/fp8_target_lmhead.py|model_executor/kernels/fp8_target_lmhead.py
 kernels/fused_silu_mul_quant.py|model_executor/layers/fused_silu_mul_quant.py
 kernels/fused_gate_mul.py|model_executor/layers/fused_gate_mul.py
 "

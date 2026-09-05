@@ -85,6 +85,7 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
   -e VLLM_UVA_OFFLOAD_EMBED=1 -e VLLM_UVA_OFFLOAD_VISUAL=1 \
   -e VLLM_DRAFT_W4_LMHEAD="${VLLM_DRAFT_W4_LMHEAD:-1}" \
   -e VLLM_R4D_MOE_CFG1="${VLLM_R4D_MOE_CFG1:-1,2,4}" -e VLLM_R4D_MOE_CFG2="${VLLM_R4D_MOE_CFG2:-1,1,1}" \
+  -e VLLM_TARGET_FP8_LMHEAD="${VLLM_TARGET_FP8_LMHEAD:-1}" -e VLLM_R4D_LRU_SKIP_EMPTY_COLD="${VLLM_R4D_LRU_SKIP_EMPTY_COLD:-0}" \
   -v "$PROFILE_DIR:/hot:ro" -v "$MODELS_DIR:/models" -v "$BUILD:/build:ro" -v "$REPO_ROOT/templates:/templates:ro" \
   -p "$PORT:8000" $PM ${EXTRA_DOCKER_ARGS:-} \
   "$IMG" "$MODEL" \
@@ -97,7 +98,7 @@ docker run -d --name "$NAME" --ipc host --cap-add SYS_PTRACE --security-opt secc
     --max-num-seqs "${NSEQ:-4}" --max-num-batched-tokens "${NBT:-4096}" \
     --enable-prefix-caching --enable-chunked-prefill \
     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-    --limit-mm-per-prompt.image 8 --limit-mm-per-prompt.video 1 --mm-processor-cache-gb .5 \
+    --limit-mm-per-prompt.image "${MM_IMAGE:-8}" --limit-mm-per-prompt.video "${MM_VIDEO:-1}" --mm-processor-cache-gb .5 \
     --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_N:-4}${SPEC_EXTRA:-}}" \
     ${EXTRA_VLLM_ARGS:-} \
     ${CHAT_TEMPLATE:+--chat-template $CHAT_TEMPLATE} \

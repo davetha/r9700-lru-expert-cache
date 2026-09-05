@@ -27,7 +27,8 @@ Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max
 | + fused SiLU-quant, QSA rope gather (c7) | 93.2 | 125.9 | 107.4 | 30.2 / 30.3 / 29.6 | 3220 | `ab3_c7` |
 | **c8 — c7 on the v2 victim kernel (what this repo builds)** | **91.8** | **124.1** | **106.2** | 30.0 / 30.8 / 29.4 | 3174 | `ab3_c8_v2` |
 | t8b — c8 at NBT 4096 with the gate GEMV on r4d | 91.4 | 130.8 | 118.7 | 29.5 / 29.6 / 30.4 | 3539 | `ab3_t8b` |
-| **cfg — t8b + MoE GEMM launch config (1,2,4)/(1,1,1) (launcher default)** | **90.9-94.1** | **128.3-128.5** | **121.0-123.2** | 28.5-29.3 / 29.2 / 29.9 | 3502-3544 | `ab3_cfg124_111`, `ab3_cfg2` |
+| cfg — t8b + MoE GEMM launch config (1,2,4)/(1,1,1) | 90.9-94.1 | 128.3-128.5 | 121.0-123.2 | 28.5-29.3 / 29.2 / 29.9 | 3502-3544 | `ab3_cfg124_111`, `ab3_cfg2` |
+| **fp8head — cfg + fp8 128x128 block-scaled target lm_head (launcher default)** | **93.1** | **138.8** | **128.5** | 27.5 / 28.1 / 28.8 | 3551 | `ab3_fp8head2` |
 
 `c7` and `c8` differ only in which build of the LRU kernel was loaded. `c7` ran the older
 `librlu_fused.so`; `c8` ran `librlu_v2.so`, whose rewritten victim selection is what
@@ -35,7 +36,9 @@ Single stream, greedy, MTP-4, 256K context, 15 GB of expert slots per rank, `max
 inside the run-to-run spread (see caveats): the v2 kernel is a wash on single-stream
 throughput and exists to remove a latency cliff that only bites at B>=4 (below).
 
-**`cfg` is what `launch/launch_q38fn.sh` reproduces**: `t8b` plus the two `VLLM_R4D_MOE_CFG*`
+**`fp8head` is what `launch/launch_q38fn.sh` reproduces**: `cfg` plus `VLLM_TARGET_FP8_LMHEAD=1`
+(-1.02 ms/step vs its paired baseline, teacher-forced |dlogprob| at the restart floor; see
+"Host gap and the fp8 target head"). `cfg` is `t8b` plus the two `VLLM_R4D_MOE_CFG*`
 knobs below (measured twice back-to-back against `t8b`: -0.54 ms/step on average, 2-4% better
 ms/step at B=2 and B=4, numerics inside the restart-noise floor; see "MoE launch config").
 `t8b` itself is `c8` plus
@@ -138,6 +141,28 @@ any rewrite could still recover; the open bf16 GEMV is at 1.05-1.13x of its cont
 all-reduce kernel costs 3.2 us/call with the rest of its time being rank skew. Full write-up,
 including why hardware counters are unusable on gfx1201 in this SDK: `docs/HOTPATH.md`.
 
+### Host gap and the fp8 target head
+
+Splitting the trace into target / draft / between-step phases (`bench/hotprobe/RESULTS.md` has the
+method) showed the four draft passes are one tight graph region, but ~1.4 ms per step of SERIAL
+worker-thread Python sits between the draft graph and the next step: sampled-token D2H (0.15 ms),
+eager text embedding through the multimodal `inputs_embeds` path (0.44 ms, with an eager
+all-reduce), rope/ngram input prep (0.33 ms) and the PLE-offload handoff (0.2 ms). Async scheduling
+does not touch this chain (measured: a wash). Three fixes were measured, each as two back-to-back
+pairs where possible:
+
+| change | ms/step vs paired base | numerics | default |
+|---|---|---|---|
+| fp8 128x128 block-scaled **target** lm_head (`kernels/fp8_target_lmhead.py`, fp8hip GEMM) | -1.02 (prose -1.58, JSON -0.74, code -0.75) | teacher-forced 0.047/0.013/0.017 vs base-vs-base 0.043/0.018/0.019 | **on** (`VLLM_TARGET_FP8_LMHEAD=1`) |
+| text-only mode (`MM_IMAGE=0 MM_VIDEO=0`): vLLM then embeds inside the graph | -0.49 | at the restart floor | off (disables image input) |
+| skip the provably-empty cold MoE GEMM call at decode (`VLLM_R4D_LRU_SKIP_EMPTY_COLD=1`) | -0.26 (two pairs) | none by construction | off |
+
+The fp8 head halves the 636 MB/rank bf16 head read (1 ms at the bandwidth roofline). Two traps:
+the weight must be quantized in row chunks, because a whole-weight `.float()` inside vLLM's
+memory-profiling forward is booked as activation peak and taken out of the KV budget (it killed KV
+sizing once); and the fragment shuffle is done per chunk for the same reason. KV headroom still
+drops by the fp8 copy (~0.33 GiB). The PLE tables (47.75 GiB of fp8) cannot leave the CPU worker.
+
 ### Caveats
 
 * **Restart-to-restart nondeterminism.** Greedy output on this box is stable within a server
@@ -213,7 +238,15 @@ server restarts (see caveats), so differences of a few percent between arms are 
 | `cfg124_111` | t8b + VLLM_R4D_MOE_CFG1=1,2,4 CFG2=1,1,1 (pair 1, first) | 94.1 | 128.5 | 121.0 | 29.25/29.24/29.88 | 0.444/0.688/0.655 | 3544 |
 | `cfg_base` | t8b (pair 1, second) | 96.7 | 137.7 | 123.4 | 29.10/29.79/30.58 | 0.451/0.778/0.693 | 3560 |
 | `base2` | t8b (pair 2, first) | 86.6 | 133.0 | 122.3 | 29.55/29.77/30.28 | 0.390/0.741/0.676 | 3484 |
-| `cfg2` | t8b + MoE cfg (pair 2, second) = launcher default | 90.9 | 128.3 | 123.2 | 28.45/29.15/29.88 | 0.394/0.687/0.672 | 3502 |
+| `cfg2` | t8b + MoE cfg (pair 2, second) | 90.9 | 128.3 | 123.2 | 28.45/29.15/29.88 | 0.394/0.687/0.672 | 3502 |
+| `skip_base1` | cfg | 90.2 | 138.9 | 121.0 | 28.95/28.93/29.52 | 0.406/0.755/0.643 | 3847 |
+| `skip_next1` | cfg + skip empty cold call | 87.7 | 131.6 | 122.7 | 28.91/28.41/29.62 | 0.384/0.686/0.659 | 3520 |
+| `skip_base2` | cfg | 95.3 | 128.5 | 124.4 | 28.90/28.95/30.15 | 0.444/0.683/0.691 | 3527 |
+| `skip_next2` | cfg + skip empty cold call | 97.0 | 135.8 | 123.5 | 28.69/28.59/29.62 | 0.443/0.721/0.665 | 3520 |
+| `mm0` | cfg, text-only mode (MM limits 0) | 101.3 | 130.9 | 126.6 | 28.72/28.43/29.62 | 0.486/0.681/0.689 | 3544 |
+| `base4` | cfg | 91.2 | 134.5 | 120.5 | 28.93/29.15/30.17 | 0.412/0.732/0.661 | 3541 |
+| `fp8head2` | cfg + skip-cold + fp8 target lm_head | 93.1 | 138.8 | 128.5 | 27.50/28.12/28.83 | 0.395/0.727/0.674 | 3551 |
+| `base5` | cfg + skip-cold | 94.6 | 138.6 | 128.4 | 29.08/28.86/29.58 | 0.444/0.752/0.698 | 3526 |
 
 
 ### Per-step kernel breakdown, baseline vs final
@@ -451,6 +484,9 @@ our test vs 148 with thinking on); `reasoning_effort` and `preserve_thinking` ar
 | `VLLM_R4D_HOT_GB` | — | total expert-weight budget per rank, in GB |
 | `VLLM_R4D_MOE_CFG1` | unset (launcher: `1,2,4`) | `wv,sk,npw` launch config of the gate_up grouped MoE GEMM; unset = the dense picker's `(4,8,2)`. Swept in `docs/HOTPATH.md`. |
 | `VLLM_R4D_MOE_CFG2` | unset (launcher: `1,1,1`) | same for the down GEMM; unset = `(8,2,2)`. |
+| `VLLM_TARGET_FP8_LMHEAD` | `0` (launcher: `1`) | quantize the TARGET lm_head to fp8 with 128x128 block scales at first use and run it through the fp8hip GEMM at M<=64. -1.0 ms/step; changes logits within restart noise. |
+| `VLLM_R4D_LRU_SKIP_EMPTY_COLD` | `0` | `1` skips the cold-fallback MoE GEMM call when every miss is provably inserted (mtk <= min(MAX_INSERTS, THRESH*S)). -0.26 ms/step, no numerics change. |
+| `MM_IMAGE` / `MM_VIDEO` (launcher) | `8` / `1` | `--limit-mm-per-prompt` values; both `0` = text-only mode, which moves the token embedding into the graph (-0.49 ms/step) and disables image input. |
 | `VLLM_R4D_SHARE_A8` | `1` | share the FP8 activation between the shared expert and the routed MoE. Unverified win; `0` in every measured arm. |
 | `VLLM_GEMMA_NORM_FUSED` | `2` | dispatch the fused `rms_norm` in eager regions. `2` casts to fp32 around the fused kernel, matching the stock decomposition up to reduction order, for **-224 kernels/step**; it is the file default and was on in every arm from `combo1` onward. `1` is the original bf16-weight variant, -288/step but it **perturbs ~30% of elements**; `0` is the stock 10-kernel path. See `docs/PATCHES.md` #1. |
 | `VLLM_GDN_STRIDED_QKV` | `0` | strided QKV into the GDN linear attention: -144 copies/step, bit-identical |

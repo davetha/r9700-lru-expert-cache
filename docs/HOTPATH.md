@@ -50,3 +50,16 @@ spinning for the slower one (|start skew| p50 7.8 us, mean 18.8 us). Kernel tuni
 SQ_BUSY_CYCLES read non-zero; FETCH_SIZE, GL2C_*, TA_*, VALU, SQ_WAVE_CYCLES, occupancy are all 0
 on this part in this build. Counters cannot separate memory stalls from occupancy here;
 the read-control method is the usable tool.
+
+## Between-step host gap (added later the same day)
+
+`hosttl.py`-style timeline of the c7 trace: after the draft graph's last kernel, the worker thread
+runs ~1.4 ms of serial Python before the next `hipGraphLaunch`: sampled-token D2H copies (0.15),
+`prepare_inputs_embeds` -> eager `embed_input_ids` through the multimodal path (0.44, with a
+dynamo region and an eager TP all-reduce), `prepare_inputs` (rope positions, ngram context; 0.33),
+PLE-offload `prepare_forward` (0.2). `hipGraphLaunch` costs 1.25 ms of CPU but overlaps the GPU.
+The draft passes are one graph region (397 kernels) with no host gaps. Async scheduling was a wash
+because this is worker-side input prep, not scheduler time. PLE tables: 47.75 GiB fp8, CPU-resident.
+
+Measured fixes (ms/step, paired): fp8 target lm_head -1.02 (adopted), text-only mode -0.49
+(off: disables images), skip empty cold MoE call -0.26 (off by choice). Details in the README.
