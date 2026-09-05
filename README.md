@@ -388,7 +388,18 @@ full expert set (~30 GiB here) plus the KV cache spill.
 **Software.**
 
 * Docker.
-* `tcclaviger/vllm:DevQwenNextFlash` — the vLLM fork image. It carries prebuilt `_C`/`_moe_C`,
+* `ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash` — a byte-identical mirror of
+  `tcclaviger/vllm:DevQwenNextFlash` (image id `1465c4571b6b`, built 2026-08-28). **The upstream
+  tag was removed from Docker Hub on 2026-09-05**; Docker Hub now carries `tcclaviger/vllm:dev`
+  (rebuilt 2026-09-05), which is the successor: it is already on ROCm 10 (torch 2.11+rocm10.0,
+  Python 3.14) and ships the same closed kernels, but vLLM moved from `/app/vllm/vllm` to
+  `/opt/vllm/lib/python3.14/site-packages/vllm`, so this repo's mounts and patch script do not
+  yet target it. Ten of the fifteen patched files are byte-identical in `dev`; the other four
+  (`r4d_mxfp4_moe.py`, `model.py`, `mtp.py`, `indexer_qsa.py`) drifted by 14-24 lines and our
+  patches 3-way-merge onto them with three one-line conflicts (imports, and `dev` gained its own
+  fused silu+fp8-quant path equivalent to `VLLM_FUSED_SILU_QUANT`). A rebase onto `dev` is the
+  planned next step. The mirror exists only so the recipe stays reproducible meanwhile.
+  The fork image carries prebuilt `_C`/`_moe_C`,
   the closed `r4d.so` / `libfp8hip_gemm.so` pybind modules, and `rfi_hip`. Not distributed here.
 * The ROCm 10 SDK, installed into that image from AMD's pip index
   (`https://stable.repo.amd.com/rocm/whl-next`) by `docker/Dockerfile`. Python 3.12 and the

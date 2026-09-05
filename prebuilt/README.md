@@ -18,5 +18,6 @@ Verify: `sha256sum -c prebuilt/SHA256SUMS`.
 
 Not included, deliberately: tcclaviger's closed `r4d.so` (the MoE grouped GEMM, QSA
 sparse attention, all-reduce) and `libfp8hip_gemm.so`. They are not ours to redistribute;
-you get them by pulling `tcclaviger/vllm:DevQwenNextFlash`, which is what the Dockerfile
+you get them by pulling `ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash` (the mirror of the
+removed upstream tag), which is what the Dockerfile
 does.

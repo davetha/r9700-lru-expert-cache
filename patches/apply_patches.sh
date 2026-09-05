@@ -10,7 +10,8 @@
 #   ./patches/apply_patches.sh --dry-run    verify every diff applies, write nothing
 #
 # Env:
-#   IMAGE      fork image to take originals from (default tcclaviger/vllm:DevQwenNextFlash)
+#   IMAGE      fork image to take originals from (default ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash,
+#              a mirror of the removed upstream tag; see README "Base image")
 #   MOE_MODE   lru (default) or static -- which r4d_mxfp4_moe.py variant to apply
 #   BUILD      output dir (default <repo>/build)
 #   WITH_FP8SK 1 also applies the experimental fp8 skinny-GEMM dispatcher. Off by default:
@@ -19,7 +20,7 @@
 set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-IMAGE=${IMAGE:-tcclaviger/vllm:DevQwenNextFlash}
+IMAGE=${IMAGE:-ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash}
 MOE_MODE=${MOE_MODE:-lru}
 BUILD=${BUILD:-$REPO_ROOT/build}
 DRY=0

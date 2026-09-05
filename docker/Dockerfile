@@ -2,7 +2,11 @@
 # Keeps python3.12 + torch 2.11 so the fork's prebuilt vllm _C/_moe_C, the closed
 # pybind11 r4d.so / libfp8hip_gemm.so and rfi_hip keep their ABI; only the HIP
 # runtime, ROCm libraries (rccl/hipblaslt/rocblas/...), torch build and triton change.
-FROM tcclaviger/vllm:DevQwenNextFlash
+# The upstream tag tcclaviger/vllm:DevQwenNextFlash was removed from Docker Hub on 2026-09-05.
+# This is a byte-identical mirror of that image (id 1465c4571b6b, built 2026-08-28). Override
+# with --build-arg BASE=... ; tcclaviger/vllm:dev is the upstream successor (see README).
+ARG BASE=ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash
+FROM ${BASE}
 ENV PIP_EXTRA_INDEX_URL=https://stable.repo.amd.com/rocm/whl-next
 RUN python3 -m pip install --no-cache-dir "torch[device-gfx1201]==2.11.0+rocm10.0.0" \
       "torchvision==0.26.0+rocm10.0.0" "torchaudio==2.11.0+rocm10.0.0" \
