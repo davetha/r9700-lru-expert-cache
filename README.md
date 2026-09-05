@@ -388,6 +388,15 @@ full expert set (~30 GiB here) plus the KV cache spill.
 **Software.**
 
 * Docker.
+* The base image. Pull it first; everything below mounts patches over it:
+
+  ```bash
+  docker pull ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash
+  ```
+
+  If you tried `tcclaviger/vllm:DevQwenNextFlash` and got `not found`, that is expected:
+  the upstream tag was removed on 2026-09-05 and this is a byte-identical mirror (details
+  in the next bullet).
 * `ghcr.io/davetha/vllm-flashnext:DevQwenNextFlash` — a byte-identical mirror of
   `tcclaviger/vllm:DevQwenNextFlash` (image id `1465c4571b6b`, built 2026-08-28). **The upstream
   tag was removed from Docker Hub on 2026-09-05**; Docker Hub now carries `tcclaviger/vllm:dev`
