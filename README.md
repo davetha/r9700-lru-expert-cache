@@ -4,6 +4,9 @@ Qwen3.8-Flash-Next decode on 2x AMD Radeon AI PRO R9700 (gfx1201): a device-side
 expert cache plus a set of kernel-count patches for [tcclaviger](https://hub.docker.com/r/tcclaviger/vllm)'s
 vLLM fork, running on a ROCm 10 image.
 
+> **Just want to run it? → [QUICKSTART.md](QUICKSTART.md)** — model download, build, launch,
+> and the one startup line to check, in five steps.
+
 The model's experts do not fit in 64 GB of VRAM, so they live in host memory and are read
 over PCIe through UVA. The stock arrangement pins a fixed hot set at load time. This repo
 makes the contents of those same VRAM buffers mutable: which expert sits in which slot is
